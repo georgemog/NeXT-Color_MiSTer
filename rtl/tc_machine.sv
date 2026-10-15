@@ -1,7 +1,8 @@
 //============================================================================
 //  tc_machine -- the NeXTstation Turbo Color: AP68040 on the TMC's 32-bit bus.
 //
-//  Structure from MacQuadra800_MiSTer rtl/quadra800.sv (the CPU bundle,
+//  Structure from MacQuadra800_MiSTer rtl/quadra800.sv (the CPU bundle --
+//  now the pipelined AP68040 behind rtl/next_ap68040.sv --
 //  wombat_bus32, the service FSM, the platform beat port and its retained-
 //  line fast paths); the address map and every device are the Turbo
 //  Color's.  "HS n" = rom-dissassembly/hardware-summary.md section n.
@@ -199,8 +200,6 @@ function [26:2] ram_sdram;        // physical -> SDRAM longword address
 	end
 endfunction
 
-// SDRAM line tag -> the canonical physical address of that line
-wire [31:4] line_phys_tag = {4'h0, {1'b0, mem_line_tag[26:25]} + 3'd2, mem_line_tag[24:4]};
 
 //----------------------------------------------------------------------------
 // decode of a beat address; the table walker sees the same physical map
@@ -288,8 +287,12 @@ assign bus_ack   = bus_line_ack || bus_miss_ack || bus_ack_adapter;
 assign bus_rdata = bus_line_ack ? bus_line_rdata :
                    bus_miss_ack ? bus_miss_rdata : bus_rdata_adapter;
 
-wire        walker_req, walker_we;
-wire [31:0] walker_addr, walker_wdat;
+// The AP68040 walks its page tables over its own bus (they reach the
+// service FSM as ordinary CPU transactions): the wombat walker port is idle.
+wire        walker_req  = 1'b0;
+wire        walker_we   = 1'b0;
+wire [31:0] walker_addr = 32'd0;
+wire [31:0] walker_wdat = 32'd0;
 reg         walker_ack;
 reg  [31:0] walker_data;
 reg         walker_berr;
@@ -298,21 +301,14 @@ reg         cpu_berr;
 wire  [2:0] ipl;
 reg         snoop_stb;        // a DMA write landed (service FSM below)
 reg  [31:2] snoop_line;
+wire        snoop_full;       // the CPU's snoop queue: hold DMA beats
 
-wombat_cpu #(.AP040_FPU_REVISION(8'h41)) cpu (
+next_ap68040 #(.FPU_REVISION(8'h41)) cpu (
 	.clk(clk),
 	.nreset(nreset),
-	.ce(ce),
-	.stall_hold(1'b0),
-	.dbg_stall_flt(),
 
 	.ipl(~ipl),
-	.ipl_autovector(1'b1),
 	.berr(cpu_berr),
-	.cache_line_valid(mem_line_valid),
-	.cache_line_tag(line_phys_tag),
-	.cache_line_data(mem_line_data),
-	.store_buffer_ok(1'b1),
 
 	.bus_req(bus_req),
 	.bus_write(bus_write),
@@ -324,22 +320,14 @@ wombat_cpu #(.AP040_FPU_REVISION(8'h41)) cpu (
 	.bus_ack(bus_ack),
 	.bus_rdata(bus_rdata),
 
-	.walker_req(walker_req),
-	.walker_we(walker_we),
-	.walker_addr(walker_addr),
-	.walker_wdat(walker_wdat),
-	.walker_ack(walker_ack),
-	.walker_data(walker_data),
-	.walker_berr(walker_berr),
-
 	.snoop_stb(snoop_stb),               // DMA write: drop the D-cache line
 	.snoop_addr({snoop_line, 2'b00}),
+	.snoop_full(snoop_full),
 
 	.nresetout(),
-	.nmi_ack_toggle(),
 	.cacr_out(),
 	.vbr_out(),
-	.debug_busy(),
+	.dbg_pc(),
 	.debug_fault(debug_fault),
 	.debug_halted(debug_halted),
 	.debug_status(debug_status),
@@ -864,7 +852,7 @@ end
 
 wire cpu_want = walker_pend || bus_first_miss || bus_wr_direct ||
                 (b_req && !b_ack && !cpu_berr && !line_cpu_wait);
-wire dma_take = dm_req && !dm_ack && !dm_err && !walker_pend && (dma_turn || !cpu_want);
+wire dma_take = dm_req && !dm_ack && !dm_err && !walker_pend && !snoop_full && (dma_turn || !cpu_want);
 
 assign dbg_berr      = (svc == S_BERR);
 assign dbg_berr_addr = {svc_addr, 2'b00};

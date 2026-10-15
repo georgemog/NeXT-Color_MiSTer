@@ -4,10 +4,9 @@ set_global_assignment -name SYSTEMVERILOG_FILE NeXT-Color.sv
 set_global_assignment -name QIP_FILE rtl/pll.qip
 set_global_assignment -name VERILOG_FILE rtl/pll_vid.v
 
-# CPU: the MacQuadra800 AP68040 tree and its wrapper (rtl/ap68040/UPSTREAM.md)
-set_global_assignment -name QIP_FILE rtl/ap68040/rtl/ap040.qip
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/ap68040/experimental/ap040_pipeline_integer.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/wombat_cpu.sv
+# CPU: the pipelined AP68040 (rtl/ap68040/UPSTREAM.md) and its NeXT bus adapter
+set_global_assignment -name QIP_FILE rtl/ap68040/ap68040.qip
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/next_ap68040.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/wombat_store_buffer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/wombat_bus32.sv
 set_global_assignment -name VERILOG_FILE rtl/dpram.v

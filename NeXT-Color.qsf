@@ -54,7 +54,6 @@ set_global_assignment -name SEED 7
 # minus MISTER_DISABLE_SHADOWMASK and the other switches that need its patched sys/,
 # and minus MISTER_DOWNSCALE_NN: 832 lines onto 720p is a downscale, and text
 # needs the filtered one).
-# The AP040_EXPERIMENTAL_* macros match the validated Quadra CPU build.
 # Seed history (full compiles):
 #   seed 1  (1be854e, 2026-09-26): 34,974 ALMs (83%), 263 M10K; clk_sys -0.068 ns
 #           (TNS -0.106, all inside ap040_core epf_data), HDMI -0.069 ns (sys/),
@@ -114,8 +113,11 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_YC=1"
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_VGA_OSD=1"
 # the DSP56001 (tc_dsp + Main next_dsp) is parked: its registers read 0
 set_global_assignment -name VERILOG_MACRO "NEXT_NO_DSP=1"
-set_global_assignment -name VERILOG_MACRO "AP040_EXPERIMENTAL_XSTORE=1"
-set_global_assignment -name VERILOG_MACRO "AP040_EXPERIMENTAL_LEA=1"
+# The pipelined AP68040 (rtl/next_ap68040.sv), as Minimig-AGA's AP68040 build:
+# no register retiming in the CPU (it adds ~6,000 registers for timing the core
+# does not need at 33 MHz; it closes 57 MHz without), synthesized for area.
+set_instance_assignment -name PHYSICAL_SYNTHESIS_REGISTER_RETIMING OFF -to "emu:emu|tc_machine:machine|next_ap68040:cpu|ap68040:cpu"
+set_instance_assignment -name OPTIMIZATION_TECHNIQUE AREA -to "emu:emu|tc_machine:machine|next_ap68040:cpu|ap68040:cpu"
 
 #set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 

@@ -240,13 +240,14 @@ assign dbg_a0    = debug_status[223:192];
 assign dbg_state = debug_status[231:224];
 assign dbg_video_enable = video_enable;
 
-// the core's exception entry registers (read by sim_main.cpp's [EXC] log)
-assign dbg_pc_i     = machine.cpu.core.pc_i;
-assign dbg_exc_vec  = machine.cpu.core.exc_vec;
-assign dbg_exc_irq  = machine.cpu.core.exc_is_irq;
-assign dbg_exc_fmt  = machine.cpu.core.exc_fmt;
-assign dbg_exc_spc  = machine.cpu.core.exc_spc;
-assign dbg_exc_addr = machine.cpu.core.exc_addr;
+// (the pipelined AP68040: dbg_pc is the PC of the last retired instruction;
+// its exception entry is not exported, so the [EXC] log stays quiet)
+assign dbg_pc_i     = machine.cpu.cpu.dbg_pc;
+assign dbg_exc_vec  = 0;
+assign dbg_exc_irq  = 0;
+assign dbg_exc_fmt  = 0;
+assign dbg_exc_spc  = 0;
+assign dbg_exc_addr = 0;
 
 // ---------------------------------------------------------------- memory
 wire [15:0] SDRAM_DQ;
@@ -283,6 +284,7 @@ tc_memsys memsys
 	.clk_vid(clk_vid),
 	.reset(reset),
 	.reset_vid(sdram_init),
+	.ddr_hold(1'b0),
 	.sdram_init(sdram_init),
 
 	.mem_req(mem_req),
@@ -347,7 +349,7 @@ tc_memsys memsys
 
 tc_enet_ddr enet_ddr
 (
-	.clk_sys(clk_sys), .clk_ram(clk_ram), .reset_ram(reset),
+	.clk_sys(clk_sys), .clk_ram(clk_ram), .ddr_hold(1'b0),   // no DDRAM terminator here
 	.s_req(enet_m_req), .s_we(enet_m_we), .s_addr(enet_m_addr), .s_wdata(enet_m_wdata),
 	.s_rdata(enet_m_rdata), .s_ack(enet_m_ack),
 	.a_busy(va_busy), .a_burstcnt(va_burstcnt), .a_addr(va_addr), .a_dout(va_dout),
