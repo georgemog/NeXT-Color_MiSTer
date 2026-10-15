@@ -101,6 +101,10 @@ set_global_assignment -name SEED 7
 #     seed 6: setup -1.253, hold -1.212.
 #     seed 7: 38,755 ALMs (92%): TIMING MET, worst +0.095 ns (HDMI), hold
 #             +0.222.  rbf md5 264728c0.  Release 20261010.
+#   fff7bc2 (the pipelined AP68040 in place of ap040_core/wombat_cpu), 2026-10-15:
+#     seed 7: 35,544 ALMs (85%), LABs 4,050 (97%), 310 M10K, 61 DSP; the CPU
+#             22,152 ALMs.  TIMING MET, worst setup +0.475 (HDMI), emu pll
+#             +0.597/+0.982, hold +0.154.  rbf md5 67b26cd8.  Not yet on hardware.
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ADAPTIVE=1"
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
