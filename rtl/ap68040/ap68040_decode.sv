@@ -424,6 +424,15 @@ always_comb begin
 		if (LOOP_PRED && lp_hit[i] && lp_x[i]) lp_exit = 1'b1;
 end
 
+// A faulted fetch word in the queue is the last one the fetch delivers until
+// a redirect (it halts on the fault).  An instruction that needs more words
+// than the queue holds then never gets them: when one of the words held is
+// faulted, the fault is raised at once instead of waiting.  (A fault on a
+// word at an address 2 mod 4 delivers that word alone, and opcode $0000 --
+// ORI.B #imm -- wants two: a JSR to a demand-paged target at ...2 froze the
+// front end in NeXTSTEP's first user process.)
+wire         flt_held = |(win_flt & ((9'd1 << qcnt) - 9'd1));
+
 always_comb begin
 	logic [31:0] disp;
 	logic        nredir;
@@ -449,9 +458,9 @@ always_comb begin
 		il = (ph == PH_EA0) ? part_imml : 3'd0;
 		l  = ea_len(i, win[0], il);
 		nrec = part;
-		if ({1'b0, l} <= qcnt) begin
-			use_n = {1'b0, l};
-			flt   = |(win_flt & ((8'd1 << l) - 8'd1));
+		if ({1'b0, l} <= qcnt || flt_held) begin
+			use_n = ({1'b0, l} <= qcnt) ? {1'b0, l} : qcnt;
+			flt   = |(win_flt & ((9'd1 << use_n) - 9'd1));
 			begin
 				// (one instance for both phases: the same words and base)
 				ea_t e;
@@ -520,6 +529,12 @@ always_comb begin
 			nrec.exc = (opw[15:12] == 4'hA) ? 8'd10 :
 			           (opw[15:12] == 4'hF) ? 8'd11 : 8'd4;
 		end
+		else if (pd0.tot > qcnt && fast && flt_held) begin
+			// cut short by a fetch fault (flt_held)
+			go    = 1'b1;
+			use_n = qcnt;
+			flt   = 1'b1;
+		end
 		else if (fast) begin
 			if (pd0.tot <= qcnt) begin
 				go    = 1'b1;
@@ -533,6 +548,12 @@ always_comb begin
 				                 qpc + {28'd0, fp1, 1'b0},
 				                 win[fp1], win[3'(fp1 + 1)], 16'd0, 16'd0, 16'd0);
 			end
+		end
+		else if ({1'b0, pd0.b} > qcnt && flt_held) begin
+			// cut short by a fetch fault (flt_held)
+			go    = 1'b1;
+			use_n = qcnt;
+			flt   = 1'b1;
 		end
 		else if ({1'b0, pd0.b} <= qcnt) begin
 			// slow path, first phase: operation word, fixed words, immediate;
