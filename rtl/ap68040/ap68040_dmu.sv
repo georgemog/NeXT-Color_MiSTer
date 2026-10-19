@@ -963,8 +963,18 @@ always_ff @(posedge clk) begin
 				e_st <= E_M_START;
 			else if (wb_slow)
 				e_st <= E_W_START;
-			else if ((dc2_slow || (e_job && m2.r.v && !e_dc2_done)) && !kill_now)
-				e_st <= E_S_START;
+			else if ((dc2_slow || (e_job && m2.r.v && !e_dc2_done)) && !kill_now) begin
+				// the job's kill mark is cleared HERE, where the uop is known
+				// alive (kill_now is excluded), not in E_S_START: a kill can
+				// land while the engine sits in E_S_START frozen by a snoop
+				// (the kill block below runs every clock, the case does not),
+				// and E_S_START's body, run after the freeze, would erase it
+				// -- the job then finished for a discarded uop, set
+				// e_dc2_done, and the next uop into DC2 was answered at once
+				// with the dead job's data (upstream PR #10, 6d146df)
+				e_kill <= 1'b0;
+				e_st   <= E_S_START;
+			end
 			else if (iw_req && !iw_done) begin
 				tw_va <= iw_va; tw_s <= iw_fc2; tw_wr <= 1'b0; tw_pt <= 1'b0; tw_i <= 1'b1;
 				e_ret <= E_I_DONE;
@@ -976,7 +986,7 @@ always_ff @(posedge clk) begin
 		// DC2 slow path
 		//==============================================================
 		E_S_START: begin
-			e_kill <= 1'b0;
+			// (e_kill: cleared when the job was scheduled, see E_IDLE)
 			e_job  <= 1'b1;
 			e_part <= 1'b0;
 			e_va   <= m2.r.a;
@@ -1244,6 +1254,12 @@ always_ff @(posedge clk) begin
 		E_S_DONE: begin
 			e_job      <= 1'b0;
 			e_dc2_done <= !e_kill;
+			// synthesis translate_off
+			// a job may only complete for a uop still in DC2: a discarded
+			// one carries e_kill
+			if (!e_kill && !m2.r.v)
+				$display("FAIL: DMU: the slow-path job completed for a discarded DC2 uop without its kill mark (e_va=%08x)", e_va);
+			// synthesis translate_on
 			e_ldata    <= e_acc;
 			steal      <= 1'b0;
 			e_st       <= E_IDLE;

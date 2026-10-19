@@ -38,13 +38,11 @@
 //  table 4-4).  TA is given once the snooper negates MI.  snoop_full asks
 //  tc_machine to hold DMA beats while the queue cannot take another line.
 //
-//  SNOOP = 0 (tc_machine's setting, 2026-10-16): no snoops.  The AP68040's
-//  data cache loses a CPU load that runs while its snooper holds the cache
-//  (SN_A..SN_R): NeXTSTEP read a pushed argument back as a value from an
-//  older frame, between two snoops of a DMA buffer line, and panicked
-//  ("illegal instruction") when a kernel thread started at that value.  With
-//  no snoops the boot runs into /etc/rc.  DMA coherency is then the drivers'
-//  (cache pushes / invalidates around DMA) -- to be confirmed for NeXTSTEP.
+//  SNOOP = 0 leaves the snoop queue empty (DMA coherency is then the
+//  drivers').  It was tc_machine's setting until the AP68040 fix for a load
+//  answered with a discarded slow-path job's data during a snoop freeze
+//  (upstream PR #10): NeXTSTEP read a pushed argument as $1112400C, the
+//  wrong-path load's value, and panicked ("illegal instruction").
 //
 //  ce must be 1 (the NeXT-Color top ties it high, as for wombat_cpu).
 //

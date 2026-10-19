@@ -303,7 +303,7 @@ reg         snoop_stb;        // a DMA write landed (service FSM below)
 reg  [31:2] snoop_line;
 wire        snoop_full;       // the CPU's snoop queue: hold DMA beats
 
-next_ap68040 #(.FPU_REVISION(8'h41), .SNOOP(0)) cpu (
+next_ap68040 #(.FPU_REVISION(8'h41)) cpu (
 	.clk(clk),
 	.nreset(nreset),
 
