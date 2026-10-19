@@ -257,14 +257,22 @@ function is_snan_x;
 	end
 endfunction
 
-// count leading zeros of a 64-bit value (fixed encoder, no shifters)
+// leading zeros of a 64-bit value (64 when zero): a tree, pairs merged
+// level by level (the upper half's count, or the lower's with the upper
+// half's size added when the upper half is empty)
 function [6:0] clz64;
 	input [63:0] v;
-	integer i;
+	reg        val [0:63];
+	reg  [5:0] cnt [0:63];
+	integer    k, i;
 	begin
-		clz64 = 7'd64;
-		for (i = 0; i < 64; i = i + 1)
-			if (v[i]) clz64 = 7'd63 - i[6:0];
+		for (i = 0; i < 64; i = i + 1) begin val[i] = v[i]; cnt[i] = 6'd0; end
+		for (k = 1; k <= 6; k = k + 1)
+			for (i = 0; i < (64 >> k); i = i + 1) begin
+				cnt[i] = val[2*i+1] ? cnt[2*i+1] : (cnt[2*i] | (6'd1 << (k - 1)));
+				val[i] = val[2*i+1] | val[2*i];
+			end
+		clz64 = val[0] ? {1'b0, cnt[0]} : 7'd64;
 	end
 endfunction
 
@@ -307,6 +315,8 @@ localparam F_STDONE = 5'd17; // store completion: settled-status trap check
 localparam F_RESTORE_A = 5'd18; // finish ET15 denormalization, shift FPTEMP
 localparam F_RESTORE_B = 5'd19; // finish FPTE15 denormalization
 localparam F_RESTORE_N = 5'd20; // normalize the prepared destination
+localparam F_CAP   = 5'd21;  // a datatype or unimplemented-instruction frame captured
+localparam F_NLZ   = 5'd22;  // the normalizer's count registered, before its shift
 
 reg  [4:0] fst;
 // unimp/unsupp decisions are made in the dispatch cycle (register
@@ -316,11 +326,40 @@ reg  [4:0] fst;
 // on nothing but done or an enabled-exception exc_req can follow.
 // (the alignment shift of an add runs after every datatype check: the
 // operation is accepted as it starts)
-assign wb_ok = (fst == F_WB) && !(|(fpsr[15:8] & fpcr[15:8]));
-assign accepted = (fst == F_ADDX) || (fst == F_MULT) ||
-                  (fst == F_SHR && sh_ret == F_ADDX) ||
-                  (fst == F_DIVL) || (fst == F_SQRTL) ||
-                  (fst == F_NORM2) || (fst == F_ROUND);
+// fst == F_WB, kept the same way (wb_ok and the core's hold start from a
+// flip-flop, not from a decode of the state register)
+reg  wb_r;
+assign wb_ok = wb_r && !(|(fpsr[15:8] & fpcr[15:8]));
+// synthesis translate_off
+always @(posedge clk)
+	if (nreset && wb_r !== (fst == F_WB)) begin
+		$display("FAIL: FPU wb_r %b, the state %0d", wb_r, fst);
+		$finish;
+	end
+// synthesis translate_on
+// accepted: a register kept with every state assignment (acc_r: the state
+// it goes to is one of these), so the core's holds start from a flip-flop
+// and not from a decode of the state register; checked in simulation
+wire acc_dec = (fst == F_ADDX) || (fst == F_MULT) ||
+               (fst == F_SHR && sh_ret == F_ADDX) ||
+               (fst == F_DIVL) || (fst == F_SQRTL) ||
+               (fst == F_NORM2) || (fst == F_NLZ && nz_ret == F_NORM2) || (fst == F_ROUND);
+reg  acc_r;
+function acc_of;
+	input [4:0] st;
+	begin
+		acc_of = (st == F_ADDX) || (st == F_MULT) || (st == F_DIVL) ||
+		         (st == F_SQRTL) || (st == F_NORM2) || (st == F_ROUND);
+	end
+endfunction
+assign accepted = acc_r;
+// synthesis translate_off
+always @(posedge clk)
+	if (nreset && acc_r !== acc_dec) begin
+		$display("FAIL: FPU accepted register %b, the state's %b (fst %0d)", acc_r, acc_dec, fst);
+		$finish;
+	end
+// synthesis translate_on
 
 reg  [2:0] r_fmt, r_dst;
 reg        r_ae7;           // accrued-IOP before this instruction (fault backout)
@@ -372,6 +411,20 @@ reg [127:0] mul_pd;           // registered DSP full product (F_MULT)
 reg   [3:0] op_kind;          // 0 none, 1 add, 2 mul, 3 div, 4 sqrt
 reg   [4:0] sh_ret;           // staged shifter return state
 reg   [1:0] r_pr;             // rounding precision latched for F_UNFL
+reg         mv_st;            // a move's F_ROUND starts: record its exception shadow
+// a datatype or unimplemented-instruction frame is captured in F_CAP, the
+// cycle after the decision, from the shadow registers (sh_src, sh_stag,
+// sh_dst, sh_dtag: one form for every site -- the dispatch records the
+// operands as such a frame wants them) and these: the command word, which
+// frame, its T and E1 flags, and a packed operand's E1
+reg  [15:0] cap_cmd;
+reg         cap_unimp, cap_t, cap_e1, cap_pk;
+// the normalizer takes two cycles: F_NLZ registers the leading-zero count
+// (nlz_q), the state it returns to (nz_ret: F_NORM, F_NORM2, F_RESTORE_N)
+// shifts by it -- the count and the shift in one cycle, with the select
+// before and the result multiplexer after, did not close at 60 MHz
+reg   [6:0] nlz_q;
+reg   [4:0] nz_ret;
 reg signed [17:0] e_w;        // working exponent (wrap safe)
 
 // These states already run in separate cycles. Select their input before
@@ -383,19 +436,28 @@ reg signed [17:0] e_w;        // working exponent (wrap safe)
 // from flip-flops rather than from a decode of fst.
 reg  [1:0] nsel;
 
-// v >> n with every bit shifted out ORed into bit 0 (n up to 67: all out)
+// v >> n with every bit shifted out ORed into bit 0 (n >= 67: all out):
+// seven stages, each ORing what it shifts out into the sticky bit
 function [66:0] shr_sticky;
 	input [66:0] v;
 	input [6:0]  n;
-	reg   [66:0] m;
+	reg   [66:0] x;
+	reg          s;
+	integer      k;
 	begin
-		m = (n >= 7'd67) ? {67{1'b1}} : ((67'd1 << n) - 67'd1);
-		shr_sticky = ((n >= 7'd67) ? 67'd0 : (v >> n)) | {66'd0, |(v & m)};
+		x = v; s = 1'b0;
+		for (k = 0; k < 7; k = k + 1)
+			if (n[k]) begin
+				s = s | |(x & ((67'd1 << (1 << k)) - 67'd1));
+				x = x >> (1 << k);
+			end
+		shr_sticky = x | {66'd0, s};
 	end
 endfunction
 // synthesis translate_off
 always @(posedge clk)
-	if (nsel != {fst == F_NORM2, fst == F_RESTORE_N})
+	if (nsel != {fst == F_NORM2 || (fst == F_NLZ && nz_ret == F_NORM2),
+	             fst == F_RESTORE_N || (fst == F_NLZ && nz_ret == F_RESTORE_N)})
 		$display("FPU: nsel %b disagrees with state %0d", nsel, fst);
 // synthesis translate_on
 
@@ -496,9 +558,9 @@ function [7:0] fp_exception_vector;
 	end
 endfunction
 
-// Operand shadow for the pending-exception frame: captured at
-// F_EXEC/F_BIN entry, where the classified source is in hand -- by the
-// time the exception is known (F_WB) the pipeline has consumed it.
+// Command shadow is captured at dispatch (or from the restored frame).
+// Operand shadow is captured at F_EXEC/F_BIN entry, where the classified
+// source is in hand -- F_WB has already consumed the working operand.
 reg [15:0] sh_cmd;
 reg [95:0] sh_src;
 reg  [2:0] sh_stag;
@@ -608,12 +670,26 @@ wire [63:0] norm_m = nsel[0] ? b_m :
                      nsel[1] ? acc_hi[63:0] :
                      p4_v    ? p4_m : a_m;
 wire [6:0] norm_lz = clz64(norm_m);
+// (the state machine shifts by the registered count; the pipeline, which
+// holds an operation only while the state machine is idle, by the count
+// of the cycle)
+wire [6:0] norm_cnt = p4_v ? norm_lz : nlz_q;
 wire [66:0] norm_shifted =
-    {norm_m, (nsel[1] ? grs : (!nsel[0] && p4_v) ? p4_g : 3'd0)} << norm_lz;
+    {norm_m, (nsel[1] ? grs : (!nsel[0] && p4_v) ? p4_g : 3'd0)} << norm_cnt;
 // one right shifter with sticky for F_SHR and the pipeline's P2 alignment
 // (P2 holds an operation only while the state machine is idle)
 wire        shr_fsm = (fst == F_SHR);
 wire [66:0] shr_out = shr_sticky(shr_fsm ? sh_v : {p2_sm, 3'd0}, shr_fsm ? sh_cnt : p2_sh);
+// one incrementer for the roundings of the shifted value (sh_v[66:3]):
+// the integer store's at bit 0, a denormal single's or double's store
+// (F_PACKS) and the underflow rounding (F_UNFL) at the precision's last
+// kept bit -- in states of their own.  (The bits below that position ride
+// along: the increment carries into the kept bits as it would from the
+// masked value, so a caller masks them off the sum.)
+wire [64:0] shk    = {1'b0, sh_v[66:3]};
+wire [64:0] shk_i  = shk + ((fst == F_PACKS) ? ((r_fmt == 3'd1) ? 65'h100_0000_0000 : 65'h800) :
+                            (fst == F_UNFL)  ? ((r_pr == 2'd1) ? 65'h100_0000_0000 :
+                                                (r_pr == 2'd2) ? 65'h800 : 65'd1) : 65'd1);
 
 // one 64x64 multiplier for both: the state machine multiplies only in
 // F_MULT, which it reaches with the pipeline empty
@@ -635,6 +711,89 @@ end
 // land on bits 96:32: one 65-bit and one 96-bit adder, not three of 128)
 wire  [64:0] mul_cross = {1'b0, mul_hl} + {1'b0, mul_lh};
 wire [127:0] mul_out = {mul_hh, mul_ll} + {31'd0, mul_cross, 32'd0};
+
+// One incrementer for the roundings of a_m at a precision's last kept bit:
+// F_ROUND's (the operation's precision) and a single or double register
+// store's (F_SRC, by the store format), in states of their own.
+wire  [1:0] rd_pr   = (fst == F_SRC) ? ((r_fmt == 3'd1) ? 2'd1 : 2'd2) : prec_of(r_op);
+wire [63:0] rd_mask = (rd_pr == 2'd1) ? 64'hFFFF_FF00_0000_0000 :
+                      (rd_pr == 2'd2) ? 64'hFFFF_FFFF_FFFF_F800 : 64'hFFFF_FFFF_FFFF_FFFF;
+wire [64:0] rd_mi   = {1'b0, a_m & rd_mask} +
+                      ((rd_pr == 2'd1) ? 65'h100_0000_0000 : (rd_pr == 2'd2) ? 65'h800 : 65'd1);
+
+// The single and double stores, in one form (F_SRC: a register's value
+// rounded to the format, or its special value; F_PACKS: a denormal after
+// the staged shift): the exponent field sd_E and the fraction sd_F as a
+// double's, the single's being their upper bits -- one exponent subtract,
+// one overflow test, one output multiplexer for both formats.  The
+// rounding takes the shared incrementer (rd_mi: rd_pr is the format's).
+reg        sd_isS, sd_den, sd_up, sd_inx, sd_ov, sd_tomax, sd_pr;
+reg signed [17:0] sd_sE;
+reg [17:0] sd_eun;
+reg [16:0] sd_enc;
+reg [63:0] sd_m;
+reg [10:0] sd_E;
+reg [51:0] sd_F;
+reg [95:0] sd_out;
+always @* begin
+	sd_isS = (r_fmt == 3'd1);
+	sd_sE  = $signed({a_e[16], a_e}) - 18'sd16383;
+	sd_den = sd_isS ? (sd_sE < -18'sd126) : (sd_sE < -18'sd1022);
+	sd_up  = sd_isS ? round_up(a_m[40], a_m[39], (a_m[38:0] != 0), a_s) :
+	                  round_up(a_m[11], a_m[10], (a_m[9:0] != 0), a_s);
+	sd_inx = sd_isS ? (a_m[39:0] != 0) : (a_m[10:0] != 0);
+	// (a rounding carry out of the significand leaves sd_m zero: the
+	// minimum of the next exponent)
+	sd_m   = sd_up ? rd_mi[63:0] : (a_m & rd_mask);
+	sd_eun = {1'b0, a_e} + {17'd0, sd_up && rd_mi[64]};
+	sd_ov  = sd_eun > (sd_isS ? 18'd16510 : 18'd17406);
+	sd_enc = sd_eun[16:0] - (sd_isS ? 17'd16256 : 17'd15360);
+	sd_tomax = (rnd_mode == 2'b01) || (rnd_mode == 2'b10 && !a_s) || (rnd_mode == 2'b11 && a_s);
+	// F_PACKS: the denormal's rounding at the format's last bit
+	sd_pr  = sd_isS ? round_up(sh_v[43], sh_v[42], sh_v[41:0] != 0, a_s) :
+	                  round_up(sh_v[14], sh_v[13], sh_v[12:0] != 0, a_s);
+	if (fst == F_PACKS) begin
+		sd_E = {10'd0, sd_pr ? shk_i[63] : shk[63]};
+		sd_F = sd_pr ? shk_i[62:11] : shk[62:11];
+	end
+	else if (a_t != T_NUM) begin
+		sd_E = (a_t == T_ZERO) ? 11'd0 : 11'h7FF;
+		sd_F = (a_t == T_NAN) ? (a_m[62:11] | 52'h8_0000_0000_0000) : 52'd0;
+	end
+	else if (sd_ov) begin
+		sd_E = sd_tomax ? 11'h7FE : 11'h7FF;
+		sd_F = sd_tomax ? {52{1'b1}} : 52'd0;
+	end
+	else begin
+		sd_E = sd_enc[10:0];
+		sd_F = sd_m[62:11];
+	end
+	sd_out = sd_isS ? {a_s, sd_E[7:0], sd_F[51:29], 64'd0} : {a_s, sd_E, sd_F, 32'd0};
+end
+
+// The arithmetic results into F_ROUND -- the add's sum, the product, the
+// quotient and the root -- through one window select: rn_r holds the
+// result with its leading bit at 67 or 66 and rn_s the sticky of the bits
+// below it; a leading bit at 67 (never for the root) takes the upper
+// window and adds one to the exponent (one less for the quotient).  One
+// source of a_m and grs for the four, not two each.
+wire [67:0] add_sum = {1'b0, b_m, 3'd0} + {1'b0, sh_v};
+reg  [67:0] rn_r;
+reg         rn_s, rn_hi;
+reg  [63:0] rn_m;
+reg   [2:0] rn_g;
+always @* begin
+	case (fst)
+		F_ADDX:  begin rn_r = add_sum;            rn_s = 1'b0; end
+		F_MULT:  begin rn_r = mul_pd[127:60];     rn_s = (mul_pd[59:0] != 60'd0); end
+		F_SQRTL: begin rn_r = {qv, 1'b0};         rn_s = (srem != 69'd0); end
+		default: begin rn_r = {qv, 1'b0};         rn_s = (acc_hi != 65'd0); end
+	endcase
+	rn_hi = rn_r[67] && (fst != F_SQRTL);
+	rn_m  = rn_hi ? rn_r[67:4] : rn_r[66:3];
+	rn_g  = rn_hi ? {rn_r[3], rn_r[2], rn_r[1] | rn_r[0] | rn_s} :
+	                {rn_r[2], rn_r[1], rn_r[0] | rn_s};
+end
 
 // FDIV and FSQRT: one restoring datapath, two steps a cycle.  Divide:
 // the remainder shifts one bit (zeros enter; the first, integer step does
@@ -1085,6 +1244,14 @@ wire [79:0] fr_bank_wd = p6_v ? {p6_s, p6_z ? 15'd0 : p6_e[14:0], p6_z ? 64'd0 :
                          fr_wb_we ? {a_s, fr_wb_e, fr_wb_m} :
                                     {fm_wdata[95], fm_wdata[94:80],
                                      fm_wdata[63:0]};
+// the written value's classes, formed for each source and then selected
+// (the write's source decode -- the state -- stays off the classifiers)
+wire fr_bank_uns  = p6_v     ? unsupported_x(p6_z ? 15'd0 : p6_e[14:0], p6_z ? 64'd0 : p6_m) :
+                    fr_wb_we ? unsupported_x(fr_wb_e, fr_wb_m) :
+                               unsupported_x(fm_wdata[94:80], fm_wdata[63:0]);
+wire fr_bank_nice = p6_v     ? nice_x(p6_z ? 15'd0 : p6_e[14:0], p6_z ? 64'd0 : p6_m) :
+                    fr_wb_we ? nice_x(fr_wb_e, fr_wb_m) :
+                               nice_x(fm_wdata[94:80], fm_wdata[63:0]);
 
 // okv one cycle on: the writers' next state, P5's niceness as it is
 // decided, P6's as it moves on, and the register file's flags after this
@@ -1092,7 +1259,7 @@ wire [79:0] fr_bank_wd = p6_v ? {p6_s, p6_z ? 15'd0 : p6_e[14:0], p6_z ? 64'd0 :
 always @* begin : okv_nx
 	integer r;
 	reg wnice;
-	wnice = nice_x(fr_bank_wd[78:64], fr_bank_wd[63:0]);
+	wnice = fr_bank_nice;
 	for (r = 0; r < 8; r = r + 1)
 		okv_n[r] = pb14_n[r] ? 1'b0 :
 		           pb5_n[r]  ? p5_nice_n :
@@ -1168,13 +1335,23 @@ end
 
 assign cur_vec = fp_exception_vector(fpsr[15:8] & fpcr[15:8]);
 
-// WinUAE's e3 predicate: OVFL/UNFL/INEX from the five arithmetic ops
-// take the 96-byte BUSY frame (Tier 2, not implemented); everything
-// else pends as the $30 e1 frame.
+// WinUAE fp_is_dyadic: the operations with a destination operand
+function dyadic;
+	input [6:0] op;
+	begin
+		dyadic = ((op & 7'h30) == 7'h20) || (op == 7'h38);
+	end
+endfunction
+
+// MC68040UM table 9-16: OVFL/UNFL/INEX from the five arithmetic ops
+// take the BUSY/E3 frame; moves, absolute value and negate use E1.
 function arith5;
 	input [6:0] op;
 	begin
-		arith5 = ((op & 7'h30) == 7'h20) || ((op & 7'h3f) == 7'h04);
+		// Include forced-precision sqrt and its saved 04 -> 05 encoding.
+		// Masking with 3f would instead include FDMOVE (44).
+		arith5 = ((op & 7'h30) == 7'h20) || op == 7'h04 ||
+		         op == 7'h05 || op == 7'h41 || op == 7'h45;
 	end
 endfunction
 
@@ -1307,7 +1484,7 @@ endtask
 
 always @(posedge clk) begin
 	if (!nreset) begin
-		fst <= F_IDLE;
+		begin fst <= F_IDLE; wb_r <= (F_IDLE == F_WB); acc_r <= 1'b0; end
 		done <= 0; unimp <= 0; unsupp <= 0; exc_req <= 0; exc_vec <= 0;
 		fpcr <= 0; fpsr <= 0; fpiar <= 0;
 		fpu_used <= 0;
@@ -1319,6 +1496,8 @@ always @(posedge clk) begin
 		fstate_e1 <= 0; fstate_grs <= 0; fstate_wbte15 <= 0;
 		fstate_busy <= 0; fstate_wbt <= 0; fstate_fpiar_c <= 0;
 		sh_cmd <= 0; sh_src <= 0; sh_stag <= 0;
+		cap_cmd <= 0; cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+		nlz_q <= 0; nz_ret <= F_NORM;
 		sh_dst <= 0; sh_dtag <= 0;
 		wb_s <= 0; wb_e <= 0; wb_m <= 0; wb_grs <= 0;
 		dout <= 0;
@@ -1331,7 +1510,7 @@ always @(posedge clk) begin
 		b_s <= 0; b_e <= 0; b_m <= 0; b_t <= 0;
 		grs <= 0; eff_sub <= 0; acc_hi <= 0; acc_lo <= 0;
 		qv <= 0; srem <= 0; srad <= 0; loop_n <= 0; op_kind <= 0;
-		sh_ret <= F_PACKI; e_w <= 0; r_pr <= 0;
+		sh_ret <= F_PACKI; e_w <= 0; r_pr <= 0; mv_st <= 0;
 		nsel <= 2'd0;
 		// Invalid entries read as the default positive nonsignaling NaN.
 		fr_valid <= 0;
@@ -1341,8 +1520,8 @@ always @(posedge clk) begin
 	end
 	else if (ce) begin
 		if (fr_bank_we) begin
-			fr_unsup[fr_bank_wa] <= unsupported_x(fr_bank_wd[78:64], fr_bank_wd[63:0]);
-			fr_nice[fr_bank_wa]  <= nice_x(fr_bank_wd[78:64], fr_bank_wd[63:0]);
+			fr_unsup[fr_bank_wa] <= fr_bank_uns;
+			fr_nice[fr_bank_wa]  <= fr_bank_nice;
 		end
 		// a request the pipeline or the state machine cannot take yet
 		// (the pipeline draining, or a source still being computed)
@@ -1396,18 +1575,36 @@ always @(posedge clk) begin
 			// the $41/$60 BUSY frame.  Both arms set fstate_unimp, so a
 			// later FSAVE EXTRACTS the prepared frame instead of trapping.
 			reg [7:0] pv;
+			reg       st, sn;
 			pv = fp_exception_vector(fpsr[15:8] & fpcr[15:8]);
-			if (pv == `AP040_VEC_FP_SNAN || pv == `AP040_VEC_FP_OPERR ||
-			    pv == `AP040_VEC_FP_DZ || !arith5(sh_cmd[6:0])) begin
+			// (table 9-16 and WinUAE's 68040 recipe: an opclass 011
+			// store's frame has T set, its source in ETEMP -- a SNAN
+			// quieted -- and in FPTEMP; SNAN/OPERR/DZ keep a dyadic
+			// operation's destination in FPTEMP; OVFL/UNFL/INEX of FMOVE
+			// to a register, FABS and FNEG the intermediate result)
+			st = (sh_cmd[15:13] == 3'b011);
+			sn = (pv == `AP040_VEC_FP_SNAN) || (pv == `AP040_VEC_FP_OPERR) ||
+			     (pv == `AP040_VEC_FP_DZ);
+			if (st || sn || !arith5(sh_cmd[6:0])) begin
 				fstate_cmd1  <= frame_cmd1(sh_cmd);
 				fstate_cmd3  <= frame_cmd3(frame_cmd1(sh_cmd));
 				fstate_stag  <= sh_stag;
-				fstate_dtag  <= 0;
-				fstate_flags <= 3'b100;   // E1
-				fstate_fpt   <= 0;
-				fstate_et    <= sh_src;
+				fstate_flags <= {1'b1, 1'b0, st};   // E1, T for a store
+				if (st) begin
+					fstate_fpt  <= sh_dst;              // the register stored
+					fstate_dtag <= sh_dtag;
+				end
+				else if (sn) begin
+					fstate_fpt  <= dyadic(sh_cmd[6:0]) ? sh_dst : 96'd0;
+					fstate_dtag <= dyadic(sh_cmd[6:0]) ? sh_dtag : 3'd0;
+				end
+				else begin
+					fstate_fpt  <= {wb_s, wb_e[14:0], 16'd0, wb_m};   // the intermediate
+					fstate_dtag <= 0;
+				end
+				fstate_et    <= (st && pv == `AP040_VEC_FP_SNAN) ? (sh_src | {33'd0, 1'b1, 62'd0}) : sh_src;
 				fstate_grs   <= (pv == `AP040_VEC_FP_SNAN) ? 3'd7 : 3'd1;
-				fstate_wbte15 <= (pv == `AP040_VEC_FP_SNAN);
+				fstate_wbte15 <= (pv == `AP040_VEC_FP_SNAN) || (st && pv == `AP040_VEC_FP_UNFL);
 				fstate_busy  <= 0;
 				fstate_e1    <= 1;
 				fstate_unimp <= 1;
@@ -1442,6 +1639,7 @@ always @(posedge clk) begin
 		end
 		if (fp_reset) begin
 			fpcr <= 0; fpsr <= 0; fpiar <= 0;
+			mv_st <= 0;
 			fpu_used <= 0;
 			fstate_unimp <= 0;
 			fstate_e1 <= 0;
@@ -1538,7 +1736,7 @@ always @(posedge clk) begin
 				sh_cnt <= restore_shift(frestore_et15, fstate_et[94:80]);
 				loop_n <= restore_shift(frestore_fpt15, fstate_fpt[94:80]);
 				sh_ret <= F_RESTORE_A;
-				fst <= F_SHR;
+				begin fst <= F_SHR; wb_r <= (F_SHR == F_WB); acc_r <= 1'b0; end
 			end
 			else if (pipe_issue) begin
 				// into the pipeline: complete as far as the core is concerned
@@ -1572,6 +1770,8 @@ always @(posedge clk) begin
 				r_ae7 <= fpsr[7];
 				r_dst <= dst_r;
 				r_op <= opmode;
+				// Preserve opclass and source register/format before execution.
+				sh_cmd <= {op_class, src_fmt, dst_r, opmode};
 				r_din <= din;
 				r_unimp <= 0;
 				r_resume <= 0;
@@ -1582,6 +1782,34 @@ always @(posedge clk) begin
 				sh_dtag <= frame_tag_x(fr_dst_e, fr_dst_m);
 				{b_s, b_e, b_m, b_t} <=
 					unpack_x(fr_dst_s, fr_dst_e, fr_dst_m);
+				// the operands as a datatype or unimplemented-instruction
+				// frame records them (F_CAP): the source raw -- a register's
+				// image; a memory operand in extended layout, a packed one
+				// in its split layout -- with its tag (an S/D denormal's is
+				// set where it is found); a store's register in both
+				if (op_class == 3'b011) begin
+					sh_dst  <= {fr_src_s, fr_src_e, 16'd0, fr_src_m};
+					sh_dtag <= frame_tag_x(fr_src_e, fr_src_m);
+				end
+				if (op_class == 3'b010 && src_fmt == 3'd7) begin
+					sh_src  <= 96'd0;
+					sh_stag <= 3'd1;
+				end
+				else if (op_class == 3'b010 && src_fmt == 3'd3) begin
+					sh_src  <= {32'd0, din[63:0]};
+					sh_stag <= 3'd7;
+					sh_dst  <= {32'd0, din[63:32], din[95:64]};
+					sh_dtag <= 3'd0;
+				end
+				else if (op_class == 3'b010) begin
+					sh_src  <= {din[95], din[94:80], 16'd0, din[63:0]};
+					sh_stag <= frame_tag_x(din[94:80], din[63:0]);
+				end
+				else begin
+					sh_src  <= {fr_src_s, fr_src_e, 16'd0, fr_src_m};
+					sh_stag <= frame_tag_x(fr_src_e, fr_src_m);
+					r_stag  <= frame_tag_x(fr_src_e, fr_src_m);
+				end
 				if (op_class == 3'b011) begin
 					// FMOVE FPn,<ea>: packed decimal and denormal/unnormal
 					// register contents are unsupported data types
@@ -1589,71 +1817,55 @@ always @(posedge clk) begin
 					// BOTH ETEMP and FPTEMP (WinUAE marks the FPTEMP/dtag
 					// half undocumented but writes it).
 					if (src_fmt == 3'd3 || src_fmt == 3'd7) begin
-						unsupp <= 1;
-						capture_datatype({op_class, src_fmt, dst_r, opmode},
-						    {fr_src_s, fr_src_e, 16'd0, fr_src_m},
-						    frame_tag_x(fr_src_e, fr_src_m),
-						    {fr_src_s, fr_src_e, 16'd0, fr_src_m},
-						    frame_tag_x(fr_src_e, fr_src_m),
-						    1'b1, 1'b1);   // T, packed -> E1
+						cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+						cap_unimp <= 0; cap_t <= 1; cap_e1 <= 1; cap_pk <= 0;   // T, packed -> E1
+						begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 					end
 					else if (fr_src_unsup) begin
-						unsupp <= 1;
-						capture_datatype({op_class, src_fmt, dst_r, opmode},
-						    {fr_src_s, fr_src_e, 16'd0, fr_src_m},
-						    frame_tag_x(fr_src_e, fr_src_m),
-						    {fr_src_s, fr_src_e, 16'd0, fr_src_m},
-						    frame_tag_x(fr_src_e, fr_src_m),
-						    1'b1, 1'b0);   // T, not packed
+						cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+						cap_unimp <= 0; cap_t <= 1; cap_e1 <= 0; cap_pk <= 0;   // T, not packed
+						begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 					end
 					else begin
 						{a_s, a_e, a_m, a_t} <=
 							unpack_x(fr_src_s, fr_src_e, fr_src_m);
-						fst <= F_SRC;   // F_SRC routes stores via r_op = STORE
+						begin fst <= F_SRC; wb_r <= (F_SRC == F_WB); acc_r <= 1'b0; end   // F_SRC routes stores via r_op = STORE
 						r_op <= 7'h7F;  // internal: store
 					end
 				end
 				else if (op_class == 3'b010 && src_fmt == 3'd7) begin : save_fmovecr
-					capture_unimp({op_class, src_fmt, dst_r, opmode},
-					               96'd0, 3'd1,
-					               {fr_dst_s, fr_dst_e, 16'd0, fr_dst_m},
-					               frame_tag_x(fr_dst_e, fr_dst_m));
+					cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+					cap_unimp <= 1; cap_pk <= 0;
+					begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 				end
 				else if (!op_in_hw(opmode)) begin : save_unimp_command
 					if (op_class == 3'b000) begin
-						capture_unimp({op_class, src_fmt, dst_r, opmode},
-						               {fr_src_s, fr_src_e, 16'd0, fr_src_m},
-						               frame_tag_x(fr_src_e, fr_src_m),
-						               {fr_dst_s, fr_dst_e, 16'd0, fr_dst_m},
-						               frame_tag_x(fr_dst_e, fr_dst_m));
+						cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+						cap_unimp <= 1; cap_pk <= 0;
+						begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 					end
 					else if (src_fmt == 3'd3) begin
 						// Packed operands use the same split payload in the short
 						// unimplemented frame as in a datatype BUSY frame.
-						capture_unimp({op_class, src_fmt, dst_r, opmode},
-						               {32'd0, din[63:0]}, 3'd7,
-						               {32'd0, din[63:32], din[95:64]}, 3'd0);
-						fstate_flags <= 3'b100; // E1 tells get_op to unpack
+						cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+						cap_unimp <= 1; cap_pk <= 1;   // E1 tells get_op to unpack
+						begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 					end
 					else begin
 						// Reuse the normal sequential source converter instead of
 						// synthesizing a second wide combinational conversion path.
 						r_unimp <= 1;
 						a_t <= T_NUM;
-						fst <= F_SRC;
+						begin fst <= F_SRC; wb_r <= (F_SRC == F_WB); acc_r <= 1'b0; end
 					end
 				end
 				else if (op_class == 3'b000) begin
 					if (fr_src_unsup) begin
-						unsupp <= 1;
 						// OPCLASS 000: source in ETEMP; a dyadic op also
 						// carries its destination in FPTEMP
-						capture_datatype({op_class, src_fmt, dst_r, opmode},
-						    {fr_src_s, fr_src_e, 16'd0, fr_src_m},
-						    frame_tag_x(fr_src_e, fr_src_m),
-						    {fr_dst_s, fr_dst_e, 16'd0, fr_dst_m},
-						    frame_tag_x(fr_dst_e, fr_dst_m),
-						    1'b0, 1'b0);
+						cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+						cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+						begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 					end
 					else begin : disp_rr
 					reg [83:0] ua;
@@ -1666,20 +1878,19 @@ always @(posedge clk) begin
 						op_kind <= bin_kind(opmode);
 						grs <= 3'd0;
 						e_w <= $signed({ua[82], ua[82:66]});
-						fst <= F_BIN;
+						begin fst <= F_BIN; wb_r <= (F_BIN == F_WB); acc_r <= 1'b0; end
 					end
 					else if ((opmode == 7'h00 || opmode == 7'h40 || opmode == 7'h44) &&
 					         ua[1:0] != T_NAN) begin
-						// a move: F_EXEC's work for it, here (its exception
-						// shadow, GRS, the working exponent), then F_ROUND
-						sh_cmd  <= {3'b010, src_fmt, dst_r, opmode};
-						sh_src  <= {ua[83], ua[80:66], 16'd0, ua[65:2]};
-						sh_stag <= r_stag;
+						// a move: F_EXEC's work for it, here (GRS, the
+						// working exponent; F_ROUND records the exception
+						// shadow as it starts: mv_st), then F_ROUND
+						mv_st <= 1'b1;
 						grs <= 3'd0;
 						e_w <= $signed({ua[82], ua[82:66]});
-						fst <= F_ROUND;
+						begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 					end
-					else fst <= F_EXEC;
+					else begin fst <= F_EXEC; wb_r <= (F_EXEC == F_WB); acc_r <= 1'b0; end
 					end
 				end
 				else begin
@@ -1687,19 +1898,18 @@ always @(posedge clk) begin
 					// an unsupported data type.  FMOVECR was handled above so
 					// its exception could retain a complete state frame.
 					if (src_fmt == 3'd3) begin
-						unsupp <= 1;
 						// The core has fetched all twelve bytes.  The 040 stores
 						// the first packed longword in FPTEMP_LO, not ETEMP_EX;
 						// FPSP get_op copies it back before calling decbin.
-						// Match Previous fp_unimp_datatype's split frame layout.
-						capture_datatype({op_class, src_fmt, dst_r, opmode},
-						    {32'd0, din[63:0]}, 3'd7,
-						    {32'd0, din[63:32], din[95:64]}, 3'd0,
-						    1'b0, 1'b1);   // packed -> E1, stag 7
+						// Match Previous fp_unimp_datatype's split frame layout
+						// (the dispatch's sh_src/sh_dst for a packed operand).
+						cap_cmd <= {op_class, src_fmt, dst_r, opmode};
+						cap_unimp <= 0; cap_t <= 0; cap_e1 <= 1; cap_pk <= 0;   // packed -> E1, stag 7
+						begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 					end
 					else begin
 						a_t <= T_NUM;   // provisional; F_SRC classifies
-						fst <= F_SRC;
+						begin fst <= F_SRC; wb_r <= (F_SRC == F_WB); acc_r <= 1'b0; end
 					end
 				end
 				end
@@ -1715,114 +1925,44 @@ always @(posedge clk) begin
 							// it alone skips the F_STDONE enabled-trap check
 							dout <= {a_s, a_e[14:0], 16'd0, a_m};
 							done <= 1; fpu_used <= 1;
-							fst <= F_IDLE;
+							begin fst <= F_IDLE; wb_r <= (F_IDLE == F_WB); acc_r <= 1'b0; end
 						end
-						3'd1: begin : pk_s
-							reg [24:0] mr;
-							reg [16:0] eun;
-							reg signed [17:0] sE, den_sh;
-							reg inx, tomax;
+						3'd1, 3'd5: begin : pk_sd
+							// single or double: one form for both (sd_out); the
+							// single's fields are the double's upper bits
+							reg signed [17:0] den_sh;
 							if (a_t != T_NUM) begin
 								// NaN payload passes through commonNaN form:
 								// the quiet bit is FORCED in the output and a
 								// signaling source raises SNAN
-								dout <= (a_t == T_ZERO) ? {a_s, 95'd0} :
-								        (a_t == T_INF)  ? {a_s, 8'hFF, 23'd0, 64'd0} :
-								                          {a_s, 8'hFF,
-								                           a_m[62:40] | 23'h400000, 64'd0};
+								dout <= sd_out;
 								if (a_t == T_NAN && !a_m[62]) begin
 									fpsr[14] <= 1;
 									fpsr[7]  <= 1;
 								end
-								fpu_used <= 1; if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
+								fpu_used <= 1; if (fpcr[15:8] == 8'd0) begin done <= 1; begin fst <= F_IDLE; wb_r <= (F_IDLE == F_WB); acc_r <= 1'b0; end end else begin fst <= F_STDONE; wb_r <= (F_STDONE == F_WB); acc_r <= 1'b0; end  // no enabled exception possible: done now
+							end
+							else if (sd_den) begin
+								// Shift into the IEEE denormal range, retaining
+								// G/R/S for the selected rounding mode.
+								den_sh = (sd_isS ? -18'sd126 : -18'sd1022) - sd_sE;
+								sh_v <= {a_m, 3'd0};
+								sh_cnt <= (den_sh > 18'sd127) ? 7'd127 : den_sh[6:0];
+								sh_ret <= F_PACKS;
+								begin fst <= F_SHR; wb_r <= (F_SHR == F_WB); acc_r <= 1'b0; end
 							end
 							else begin
-								sE = $signed({a_e[16], a_e}) - 18'sd16383;
-								if (sE < -18'sd126) begin
-									// Shift into the IEEE single denormal range, retaining
-									// G/R/S for the selected rounding mode.
-									den_sh = -18'sd126 - sE;
-									sh_v <= {a_m, 3'd0};
-									sh_cnt <= (den_sh > 18'sd127) ? 7'd127 : den_sh[6:0];
-									sh_ret <= F_PACKS;
-									fst <= F_SHR;
-								end
-								else begin
-								mr = {1'b0, a_m[63:40]} +
-								     {24'd0, round_up(a_m[40], a_m[39],
-								                      (a_m[38:0] != 0), a_s)};
-								inx = a_m[39:0] != 0;
-								eun = a_e + {16'd0, mr[24]};       // renorm on carry
-								if (mr[24]) mr = {1'b0, 1'b1, 23'd0};
-								if ($signed({1'b0, eun}) - 18'sd16383 > 18'sd127) begin
-									tomax = (rnd_mode == 2'b01) ||
-									        (rnd_mode == 2'b10 && !a_s) ||
-									        (rnd_mode == 2'b11 && a_s);
-									dout <= tomax ? {a_s, 8'hFE, 23'h7FFFFF, 64'd0} :
-									                 {a_s, 8'hFF, 23'd0, 64'd0};
+								dout <= sd_out;
+								if (sd_ov) begin
+									// (INEX2 only for bits actually lost, as
+									// softfloat's 68K roundAndPackFloat32 raises
+									// inexact; accrued INEX comes with OVFL)
 									fpsr[12] <= 1; fpsr[6] <= 1;
-									fpsr[9] <= 1;  fpsr[3] <= 1;
+									if (sd_inx) fpsr[9] <= 1;
+									fpsr[3] <= 1;
 								end
-								else begin : pk_s_enc
-									reg [16:0] enc;
-									enc = eun - 17'd16256;   // -16383 +127
-									dout <= {a_s, enc[7:0], mr[22:0], 64'd0};
-									if (inx) begin fpsr[9] <= 1; fpsr[3] <= 1; end
-								end
-								fpu_used <= 1; if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
-								end
-							end
-						end
-						3'd5: begin : pk_d
-							reg [53:0] mr;
-							reg [16:0] eun;
-							reg signed [17:0] sE, den_sh;
-							reg inx, tomax;
-							if (a_t != T_NUM) begin
-								dout <= (a_t == T_ZERO) ? {a_s, 95'd0} :
-								        (a_t == T_INF)  ? {a_s, 11'h7FF, 52'd0, 32'd0} :
-								                          {a_s, 11'h7FF,
-								                           a_m[62:11] | 52'h8_0000_0000_0000,
-								                           32'd0};
-								if (a_t == T_NAN && !a_m[62]) begin
-									fpsr[14] <= 1;
-									fpsr[7]  <= 1;
-								end
-								fpu_used <= 1; if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
-							end
-							else begin
-								sE = $signed({a_e[16], a_e}) - 18'sd16383;
-								if (sE < -18'sd1022) begin
-									den_sh = -18'sd1022 - sE;
-									sh_v <= {a_m, 3'd0};
-									sh_cnt <= (den_sh > 18'sd127) ? 7'd127 : den_sh[6:0];
-									sh_ret <= F_PACKS;
-									fst <= F_SHR;
-								end
-								else begin
-								mr = {1'b0, a_m[63:11]} +
-								     {53'd0, round_up(a_m[11], a_m[10],
-								                      (a_m[9:0] != 0), a_s)};
-								inx = a_m[10:0] != 0;
-								eun = a_e + {16'd0, mr[53]};
-								if (mr[53]) mr = {1'b0, 1'b1, 52'd0};
-								if ($signed({1'b0, eun}) - 18'sd16383 > 18'sd1023) begin
-									tomax = (rnd_mode == 2'b01) ||
-									        (rnd_mode == 2'b10 && !a_s) ||
-									        (rnd_mode == 2'b11 && a_s);
-									dout <= tomax ? {a_s, 11'h7FE, 52'hFFFFFFFFFFFFF, 32'd0} :
-									                 {a_s, 11'h7FF, 52'd0, 32'd0};
-									fpsr[12] <= 1; fpsr[6] <= 1;
-									fpsr[9] <= 1;  fpsr[3] <= 1;
-								end
-								else begin : pk_d_enc
-									reg [16:0] enc;
-									enc = eun - 17'd15360;   // -16383 +1023
-									dout <= {a_s, enc[10:0], mr[51:0], 32'd0};
-									if (inx) begin fpsr[9] <= 1; fpsr[3] <= 1; end
-								end
-								fpu_used <= 1; if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
-								end
+								else if (sd_inx) begin fpsr[9] <= 1; fpsr[3] <= 1; end
+								fpu_used <= 1; if (fpcr[15:8] == 8'd0) begin done <= 1; begin fst <= F_IDLE; wb_r <= (F_IDLE == F_WB); acc_r <= 1'b0; end end else begin fst <= F_STDONE; wb_r <= (F_STDONE == F_WB); acc_r <= 1'b0; end  // no enabled exception possible: done now
 							end
 						end
 						default: begin : pk_i
@@ -1837,7 +1977,7 @@ always @(posedge clk) begin
 								sE = $signed({a_e[16], a_e}) - 18'sd16383;
 							qm = a_m | 64'h4000_0000_0000_0000;
 							if (a_t == T_ZERO) begin
-								sh_v <= 0; sh_cnt <= 0; fst <= F_PACKI;
+								sh_v <= 0; sh_cnt <= 0; begin fst <= F_PACKI; wb_r <= (F_PACKI == F_WB); acc_r <= 1'b0; end
 							end
 							else if (a_t == T_NAN) begin
 								// floatx80_to_int32/16/8: the QUIETED NaN's
@@ -1855,24 +1995,24 @@ always @(posedge clk) begin
 									fpsr[13] <= 1;
 									fpsr[7]  <= 1;
 								end
-								fpu_used <= 1; if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
+								fpu_used <= 1; if (fpcr[15:8] == 8'd0) begin done <= 1; begin fst <= F_IDLE; wb_r <= (F_IDLE == F_WB); acc_r <= 1'b0; end end else begin fst <= F_STDONE; wb_r <= (F_STDONE == F_WB); acc_r <= 1'b0; end  // no enabled exception possible: done now
 							end
 							else if (a_t == T_INF || sE > 18'sd62) begin
 								// infinity or far out of range: OPERR with
 								// sign-dependent saturation
 								sh_v <= 67'h7FFFFFFFFFFFFFFFF;
 								sh_cnt <= 7'd127;   // marker
-								fst <= F_PACKI;
+								begin fst <= F_PACKI; wb_r <= (F_PACKI == F_WB); acc_r <= 1'b0; end
 							end
 							else if (sE < -18'sd1) begin
 								sh_v <= {64'd0, 1'b0, 1'b0, 1'b1};  // sticky only
-								sh_cnt <= 0; fst <= F_PACKI;
+								sh_cnt <= 0; begin fst <= F_PACKI; wb_r <= (F_PACKI == F_WB); acc_r <= 1'b0; end
 							end
 							else begin
 								sh_v <= {a_m, 3'd0};
 								sh_cnt <= 7'd63 - sE[6:0];
 								sh_ret <= F_PACKI;
-								fst <= F_SHR;
+								begin fst <= F_SHR; wb_r <= (F_SHR == F_WB); acc_r <= 1'b0; end
 							end
 						end
 					endcase
@@ -1886,7 +2026,7 @@ always @(posedge clk) begin
 							a_m <= unp_m;
 							a_e <= 17'd16383 + 17'd31;   // integer bit at 63
 							r_stag <= (r_din[95:64] == 32'd0) ? 3'd1 : 3'd0;
-							fst <= F_NORM;
+							begin fst <= F_NLZ; wb_r <= 1'b0; nz_ret <= F_NORM; acc_r <= 1'b0; end
 						end
 						3'd4: begin : cv_w
 							a_s <= r_din[95];
@@ -1894,7 +2034,7 @@ always @(posedge clk) begin
 							a_m <= unp_m;
 							a_e <= 17'd16383 + 17'd15;
 							r_stag <= (r_din[95:80] == 16'd0) ? 3'd1 : 3'd0;
-							fst <= F_NORM;
+							begin fst <= F_NLZ; wb_r <= 1'b0; nz_ret <= F_NORM; acc_r <= 1'b0; end
 						end
 						3'd6: begin : cv_b
 							a_s <= r_din[95];
@@ -1902,7 +2042,7 @@ always @(posedge clk) begin
 							a_m <= unp_m;
 							a_e <= 17'd16383 + 17'd7;
 							r_stag <= (r_din[95:88] == 8'd0) ? 3'd1 : 3'd0;
-							fst <= F_NORM;
+							begin fst <= F_NLZ; wb_r <= 1'b0; nz_ret <= F_NORM; acc_r <= 1'b0; end
 						end
 						3'd1: begin : cv_s
 							a_s <= r_din[95];
@@ -1915,7 +2055,7 @@ always @(posedge clk) begin
 								// (The quiet bit is bit 62 and is set below for an
 								// SNaN.)  Infinity is canonicalized during writeback.
 								a_m <= unp_m;
-								fst <= F_EXEC;
+								begin fst <= F_EXEC; wb_r <= (F_EXEC == F_WB); acc_r <= 1'b0; end
 							end
 							else if (r_din[94:87] == 8'd0) begin
 								if (r_din[86:64] != 0) begin
@@ -1925,17 +2065,13 @@ always @(posedge clk) begin
 									if (r_unimp) begin
 										a_t <= T_NUM; a_e <= 17'd16257;
 										a_m <= unp_m;
-										r_stag <= 3'd5; fst <= F_NORM;
+										r_stag <= 3'd5; begin fst <= F_NLZ; wb_r <= 1'b0; nz_ret <= F_NORM; acc_r <= 1'b0; end
 									end
 									else begin
-										unsupp <= 1;
-										capture_datatype(
-										    {3'b010, r_fmt, r_dst, r_op},
-										    {r_din[95], r_din[94:80], 16'd0,
-										     r_din[63:0]}, 3'd5,
-										    sh_dst, sh_dtag,
-										    1'b0, 1'b0);
-										fst <= F_IDLE;
+										sh_stag <= 3'd5;
+										cap_cmd <= {3'b010, r_fmt, r_dst, r_op};
+										cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+										begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 									end
 								end
 								else begin
@@ -1943,7 +2079,7 @@ always @(posedge clk) begin
 									a_t <= T_ZERO;
 									a_m <= unp_m;        // (zero: exponent and fraction 0)
 									a_e <= 0;
-									fst <= F_EXEC;
+									begin fst <= F_EXEC; wb_r <= (F_EXEC == F_WB); acc_r <= 1'b0; end
 								end
 							end
 							else begin
@@ -1957,22 +2093,18 @@ always @(posedge clk) begin
 									op_kind <= bin_kind(r_op);
 									grs <= 3'd0;
 									e_w <= $signed({9'd0, r_din[94:87]}) + 18'sd16256;
-									fst <= F_BIN;
+									begin fst <= F_BIN; wb_r <= (F_BIN == F_WB); acc_r <= 1'b0; end
 								end
 								else if ((r_op == 7'h00 || r_op == 7'h40 || r_op == 7'h44) && !r_unimp) begin
 									// a move: F_EXEC's work for it, here
-									// (as for a register source)
-									if (!r_resume) begin
-										sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
-										sh_src  <= {r_din[95], {7'd0, r_din[94:87]} + 15'd16256, 16'd0,
-										            1'b1, r_din[86:64], 40'd0};
-										sh_stag <= 3'd0;
-									end
+									// (as for a register source; the shadow
+									// as F_ROUND starts)
+									mv_st <= !r_resume;
 									grs <= 3'd0;
 									e_w <= $signed({9'd0, r_din[94:87]}) + 18'sd16256;
-									fst <= F_ROUND;
+									begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 								end
-								else fst <= F_EXEC;
+								else begin fst <= F_EXEC; wb_r <= (F_EXEC == F_WB); acc_r <= 1'b0; end
 							end
 						end
 						3'd5: begin : cv_d
@@ -1985,7 +2117,7 @@ always @(posedge clk) begin
 								// only the payload (and, when needed, quiet bit 62) is
 								// carried into the extended significand.
 								a_m <= unp_m;
-								fst <= F_EXEC;
+								begin fst <= F_EXEC; wb_r <= (F_EXEC == F_WB); acc_r <= 1'b0; end
 							end
 							else if (r_din[94:84] == 11'd0) begin
 								if (r_din[83:32] != 0) begin
@@ -1994,17 +2126,13 @@ always @(posedge clk) begin
 									if (r_unimp) begin
 										a_t <= T_NUM; a_e <= 17'd15361;
 										a_m <= unp_m;
-										r_stag <= 3'd5; fst <= F_NORM;
+										r_stag <= 3'd5; begin fst <= F_NLZ; wb_r <= 1'b0; nz_ret <= F_NORM; acc_r <= 1'b0; end
 									end
 									else begin
-										unsupp <= 1;
-										capture_datatype(
-										    {3'b010, r_fmt, r_dst, r_op},
-										    {r_din[95], r_din[94:80], 16'd0,
-										     r_din[63:0]}, 3'd5,
-										    sh_dst, sh_dtag,
-										    1'b0, 1'b0);
-										fst <= F_IDLE;
+										sh_stag <= 3'd5;
+										cap_cmd <= {3'b010, r_fmt, r_dst, r_op};
+										cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+										begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 									end
 								end
 								else begin
@@ -2012,7 +2140,7 @@ always @(posedge clk) begin
 									a_t <= T_ZERO;
 									a_m <= unp_m;        // (zero: exponent and fraction 0)
 									a_e <= 0;
-									fst <= F_EXEC;
+									begin fst <= F_EXEC; wb_r <= (F_EXEC == F_WB); acc_r <= 1'b0; end
 								end
 							end
 							else begin
@@ -2024,21 +2152,16 @@ always @(posedge clk) begin
 									op_kind <= bin_kind(r_op);
 									grs <= 3'd0;
 									e_w <= $signed({7'd0, r_din[94:84]}) + 18'sd15360;
-									fst <= F_BIN;
+									begin fst <= F_BIN; wb_r <= (F_BIN == F_WB); acc_r <= 1'b0; end
 								end
 								else if ((r_op == 7'h00 || r_op == 7'h40 || r_op == 7'h44) && !r_unimp) begin
 									// a move: F_EXEC's work for it, here
-									if (!r_resume) begin
-										sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
-										sh_src  <= {r_din[95], {4'd0, r_din[94:84]} + 15'd15360, 16'd0,
-										            1'b1, r_din[83:32], 11'd0};
-										sh_stag <= 3'd0;
-									end
+									mv_st <= !r_resume;
 									grs <= 3'd0;
 									e_w <= $signed({7'd0, r_din[94:84]}) + 18'sd15360;
-									fst <= F_ROUND;
+									begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 								end
-								else fst <= F_EXEC;
+								else begin fst <= F_EXEC; wb_r <= (F_EXEC == F_WB); acc_r <= 1'b0; end
 							end
 						end
 						default: begin : cv_x
@@ -2046,25 +2169,19 @@ always @(posedge clk) begin
 								if (r_unimp) begin
 									{a_s, a_e, a_m, a_t} <=
 										unpack_x(r_din[95], r_din[94:80], r_din[63:0]);
-									r_stag <= 3'd4; fst <= F_NORM;
+									r_stag <= 3'd4; begin fst <= F_NLZ; wb_r <= 1'b0; nz_ret <= F_NORM; acc_r <= 1'b0; end
 								end
 								else begin
-									unsupp <= 1;
-									capture_datatype(
-									    {3'b010, r_fmt, r_dst, r_op},
-									    {r_din[95], r_din[94:80], 16'd0,
-									     r_din[63:0]},
-									    frame_tag_x(r_din[94:80], r_din[63:0]),
-									    sh_dst, sh_dtag,
-									    1'b0, 1'b0);
-									fst <= F_IDLE;
+									cap_cmd <= {3'b010, r_fmt, r_dst, r_op};
+									cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+									begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 								end
 							end
 							else if (r_unimp) begin
 								r_stag <= frame_tag_x(r_din[94:80], r_din[63:0]);
 								{a_s, a_e, a_m, a_t} <=
 									unpack_x(r_din[95], r_din[94:80], r_din[63:0]);
-								fst <= F_NORM;
+								begin fst <= F_NLZ; wb_r <= 1'b0; nz_ret <= F_NORM; acc_r <= 1'b0; end
 							end
 							else begin : cv_xs
 								// a supported extended operand is normalized
@@ -2081,24 +2198,44 @@ always @(posedge clk) begin
 									op_kind <= bin_kind(r_op);
 									grs <= 3'd0;
 									e_w <= $signed({ua[82], ua[82:66]});
-									fst <= F_BIN;
+									begin fst <= F_BIN; wb_r <= (F_BIN == F_WB); acc_r <= 1'b0; end
 								end
 								else if ((r_op == 7'h00 || r_op == 7'h40 || r_op == 7'h44) &&
 								         ua[1:0] != T_NAN) begin
-									if (!r_resume) begin
-										sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
-										sh_src  <= {ua[83], ua[80:66], 16'd0, ua[65:2]};
-										sh_stag <= tg;
-									end
+									mv_st <= !r_resume;
 									grs <= 3'd0;
 									e_w <= $signed({ua[82], ua[82:66]});
-									fst <= F_ROUND;
+									begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 								end
-								else fst <= F_EXEC;
+								else begin fst <= F_EXEC; wb_r <= (F_EXEC == F_WB); acc_r <= 1'b0; end
 							end
 						end
 					endcase
 				end
+			end
+
+			F_NLZ: begin
+				// the normalizer's count, registered; its input select
+				// (nsel) stays as the entering state set it
+				nlz_q <= norm_lz;
+				nsel  <= nsel;
+				begin fst <= nz_ret; wb_r <= (nz_ret == F_WB); acc_r <= acc_of(nz_ret); end
+			end
+
+			F_CAP: begin
+				// the datatype or unimplemented-instruction frame, from the
+				// shadow registers the deciding site prepared (one form for
+				// every site: the frame's operand multiplexers do not grow
+				// with the sites)
+				if (cap_unimp) begin
+					capture_unimp(cap_cmd, sh_src, sh_stag, sh_dst, sh_dtag);
+					if (cap_pk) fstate_flags <= 3'b100;   // E1 tells get_op to unpack
+				end
+				else begin
+					unsupp <= 1;
+					capture_datatype(cap_cmd, sh_src, sh_stag, sh_dst, sh_dtag, cap_t, cap_e1);
+				end
+				begin fst <= F_IDLE; wb_r <= (F_IDLE == F_WB); acc_r <= 1'b0; end
 			end
 
 			F_RESTORE_A: begin
@@ -2112,7 +2249,7 @@ always @(posedge clk) begin
 				sh_v <= {b_m, 3'd0};
 				sh_cnt <= loop_n;
 				sh_ret <= F_RESTORE_B;
-				fst <= F_SHR;
+				begin fst <= F_SHR; wb_r <= (F_SHR == F_WB); acc_r <= 1'b0; end
 			end
 
 			F_RESTORE_B: begin
@@ -2120,7 +2257,7 @@ always @(posedge clk) begin
 				if (b_t == T_NUM && sh_v[66:3] == 0) b_t <= T_ZERO;
 				sh_dst <= {b_s, b_e[14:0], 16'd0, sh_v[66:3]};
 				sh_dtag <= frame_tag_x(b_e[14:0], sh_v[66:3]);
-				fst <= F_RESTORE_N;
+				begin fst <= F_NLZ; wb_r <= 1'b0; nz_ret <= F_RESTORE_N; acc_r <= 1'b0; end
 				nsel <= 2'b01;
 			end
 
@@ -2129,13 +2266,13 @@ always @(posedge clk) begin
 				// The normal instruction path still traps on these operands.
 				if (b_t == T_NUM) begin
 					b_m <= norm_shifted[66:3];
-					b_e <= b_e - {10'd0, norm_lz};
+					b_e <= b_e - {10'd0, nlz_q};
 				end
-				fst <= F_NORM;
+				begin fst <= F_NLZ; wb_r <= 1'b0; nz_ret <= F_NORM; acc_r <= 1'b0; end
 			end
 
 			F_NORM: begin
-				if (a_t != T_NUM) fst <= F_EXEC;
+				if (a_t != T_NUM) begin fst <= F_EXEC; wb_r <= (F_EXEC == F_WB); acc_r <= 1'b0; end
 				else begin
 					// a zero significand normalizes to zero: a_m takes the
 					// shifter's output either way, the zero test only
@@ -2144,24 +2281,23 @@ always @(posedge clk) begin
 					if (a_m == 64'd0) begin
 						a_t <= T_ZERO; a_e <= 0;
 					end
-					else a_e <= a_e - {10'd0, norm_lz};
-					fst <= F_EXEC;
+					else a_e <= a_e - {10'd0, nlz_q};
+					begin fst <= F_EXEC; wb_r <= (F_EXEC == F_WB); acc_r <= 1'b0; end
 				end
 			end
 
 			F_EXEC: begin
 				// operand shadow for a possible deferred-exception frame
 				if (!r_resume) begin
-					sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
 					sh_src  <= {a_s, a_e[14:0], 16'd0, a_m};
 					sh_stag <= r_stag;
 				end
 				if (r_unimp) begin
-					capture_unimp({3'b010, r_fmt, r_dst, r_op},
-					               {a_s, a_e[14:0], 16'd0, a_m}, r_stag,
-					               sh_dst, sh_dtag);
+					// (sh_src/sh_stag written above, this cycle)
+					cap_cmd <= sh_cmd;
+					cap_unimp <= 1; cap_pk <= 0;
 					r_unimp <= 0;
-					fst <= F_IDLE;
+					begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 				end
 				// FCMP evaluates its destination without passing through
 				// F_BIN, so its unsupported-datatype check lives here -- and
@@ -2170,12 +2306,9 @@ always @(posedge clk) begin
 				// status byte stays clean.
 				else if (!r_resume && r_op == 7'h38 &&
 				    unsupported_x(b_e[14:0], b_m)) begin
-					unsupp <= 1;
-					capture_datatype({3'b010, r_fmt, r_dst, r_op},
-					    {a_s, a_e[14:0], 16'd0, a_m}, r_stag,
-					    sh_dst, sh_dtag,
-					    1'b0, 1'b0);
-					fst <= F_IDLE;
+					cap_cmd <= sh_cmd;
+					cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+					begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 				end
 				else begin
 				// Quiet signaling NaNs after recording SNAN.  Source and
@@ -2200,20 +2333,20 @@ always @(posedge clk) begin
 				grs <= 3'd0;
 				e_w <= $signed({a_e[16], a_e});
 				case (r_op)
-					7'h38, 7'h3A: fst <= F_WB;               // FCMP/FTST
+					7'h38, 7'h3A: begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end               // FCMP/FTST
 					7'h00, 7'h40, 7'h44,
 					7'h18, 7'h58, 7'h5C,
-					7'h1A, 7'h5A, 7'h5E: fst <= F_ROUND;     // move class
+					7'h1A, 7'h5A, 7'h5E: begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end     // move class
 					7'h04, 7'h41, 7'h45: begin               // FSQRT
 						op_kind <= 4'd4;
-						fst <= F_BIN;
+						begin fst <= F_BIN; wb_r <= (F_BIN == F_WB); acc_r <= 1'b0; end
 					end
 					default: begin : ex_bin
 						op_kind <= (r_op == 7'h23 || r_op == 7'h27 ||
 						            r_op == 7'h63 || r_op == 7'h67) ? 4'd2 :
 						           (r_op == 7'h20 || r_op == 7'h24 ||
 						            r_op == 7'h60 || r_op == 7'h64) ? 4'd3 : 4'd1;
-						fst <= F_BIN;
+						begin fst <= F_BIN; wb_r <= (F_BIN == F_WB); acc_r <= 1'b0; end
 					end
 				endcase
 				end
@@ -2221,8 +2354,9 @@ always @(posedge clk) begin
 
 			F_BIN: begin : f_bin
 				reg        s_a;
-				if (!r_resume) begin
-					sh_cmd  <= {3'b010, r_fmt, r_dst, r_op};
+				// NaNs went through F_EXEC, which saved the source before
+				// quieting it. Keep that image for SNAN and datatype recovery.
+				if (!r_resume && a_t != T_NAN) begin
 					sh_src  <= {a_s, a_e[14:0], 16'd0, a_m};
 					sh_stag <= r_stag;
 				end
@@ -2238,12 +2372,9 @@ always @(posedge clk) begin
 					// dispatch; r_ae7 holds the prior accrued-IOP bit)
 					fpsr[14] <= 0;
 					fpsr[7]  <= r_ae7;
-					unsupp <= 1;
-					capture_datatype({3'b010, r_fmt, r_dst, r_op},
-					    {a_s, a_e[14:0], 16'd0, a_m}, r_stag,
-					    sh_dst, sh_dtag,
-					    1'b0, 1'b0);
-					fst <= F_IDLE;
+					cap_cmd <= sh_cmd;
+					cap_unimp <= 0; cap_t <= 0; cap_e1 <= 0; cap_pk <= 0;
+					begin fst <= F_CAP; wb_r <= (F_CAP == F_WB); acc_r <= 1'b0; end
 				end
 				else begin
 				if (op_kind != 4'd4 && b_t == T_NAN && !b_m[62]) begin
@@ -2260,11 +2391,11 @@ always @(posedge clk) begin
 					end
 					else a_m <= a_m | 64'h4000_0000_0000_0000;
 					a_t <= T_NAN;
-					fst <= F_WB;
+					begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 				end
 				else case (op_kind)
 					4'd4: begin : bin_sqrt
-						if (a_t == T_ZERO) fst <= F_WB;         // sqrt(+-0)=+-0
+						if (a_t == T_ZERO) begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end         // sqrt(+-0)=+-0
 						else if (a_s) begin
 							// negative: operand error, POSITIVE default NaN
 							// (floatx80_default_nan has the sign bit clear)
@@ -2274,9 +2405,9 @@ always @(posedge clk) begin
 							a_e <= 17'h07FFF;
 							fpsr[13] <= 1;
 							fpsr[7] <= 1;
-							fst <= F_WB;
+							begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 						end
-						else if (a_t == T_INF) fst <= F_WB;
+						else if (a_t == T_INF) begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 						else begin : sq_go
 							reg signed [17:0] sE;
 							sE = $signed({a_e[16], a_e}) - 18'sd16383;
@@ -2284,14 +2415,14 @@ always @(posedge clk) begin
 							if (a_m == 64'h8000_0000_0000_0000 && !sE[0]) begin
 								// Exact square root of an even power of two.
 								grs <= 0;
-								fst <= F_ROUND;
+								begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 							end
 							else begin
 								srad <= sE[0] ? {a_m, 2'b00} : {1'b0, a_m, 1'b0};
 								srem <= 0;
 								qv <= 0;
 								loop_n <= 0;
-								fst <= F_SQRTL;
+								begin fst <= F_SQRTL; wb_r <= (F_SQRTL == F_WB); acc_r <= 1'b1; end
 							end
 						end
 					end
@@ -2314,12 +2445,12 @@ always @(posedge clk) begin
 								a_m <= (b_t == T_INF) ? b_m : a_m;
 								a_t <= T_INF;
 							end
-							fst <= F_WB;
+							begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 						end
 						else if (a_t == T_ZERO && b_t == T_ZERO) begin
 							a_s <= (s_a == b_s) ? s_a : (rnd_mode == 2'b10);
 							a_t <= T_ZERO;
-							fst <= F_WB;
+							begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 						end
 						else if (a_t == T_ZERO) begin
 							a_s <= b_s;
@@ -2327,12 +2458,12 @@ always @(posedge clk) begin
 							a_m <= b_m;
 							a_t <= T_NUM;
 							e_w <= $signed({b_e[16], b_e});
-							fst <= F_ROUND;
+							begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 						end
 						else if (b_t == T_ZERO) begin
 							a_s <= s_a;
 							e_w <= $signed({a_e[16], a_e});
-							fst <= F_ROUND;
+							begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 						end
 						else begin : bin_addnum
 							reg        aswap;
@@ -2354,7 +2485,7 @@ always @(posedge clk) begin
 							sh_v <= {aswap ? b_m : a_m, 3'd0};
 							sh_cnt <= (d > 17'd66) ? 7'd67 : d[6:0];
 							sh_ret <= F_ADDX;
-							fst <= F_SHR;
+							begin fst <= F_SHR; wb_r <= (F_SHR == F_WB); acc_r <= 1'b1; end
 						end
 					end
 					4'd2: begin : bin_mul
@@ -2391,12 +2522,12 @@ always @(posedge clk) begin
 								a_s <= a_s ^ b_s;
 								a_m <= (b_t == T_INF) ? b_m : a_m;
 							end
-							fst <= F_WB;
+							begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 						end
 						else if (a_t == T_ZERO || b_t == T_ZERO) begin
 							a_t <= T_ZERO;
 							a_s <= a_s ^ b_s;
-							fst <= F_WB;
+							begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 						end
 						else begin
 							a_s <= a_s ^ b_s;
@@ -2407,7 +2538,7 @@ always @(posedge clk) begin
 								// sign/exponent and needs no iterative multiply.
 								a_m <= a_p2 ? bm_eff : am_eff;
 								grs <= 0;
-								fst <= F_ROUND;
+								begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 							end
 							else begin
 								acc_hi <= 0;
@@ -2415,7 +2546,7 @@ always @(posedge clk) begin
 								loop_n <= 0;
 								mul_x  <= am_eff;
 								mul_y  <= bm_eff;
-								fst <= F_MULT;
+								begin fst <= F_MULT; wb_r <= (F_MULT == F_WB); acc_r <= 1'b1; end
 							end
 						end
 					end
@@ -2440,7 +2571,7 @@ always @(posedge clk) begin
 							a_e <= 17'h07FFF;
 							fpsr[13] <= 1;
 							fpsr[7] <= 1;
-							fst <= F_WB;
+							begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 						end
 						else if (a_t == T_ZERO && b_t == T_ZERO) begin
 							a_t <= T_NAN;
@@ -2449,7 +2580,7 @@ always @(posedge clk) begin
 							a_e <= 17'h07FFF;
 							fpsr[13] <= 1;
 							fpsr[7] <= 1;
-							fst <= F_WB;
+							begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 						end
 						else if (b_t == T_INF) begin
 							// dividend infinity passes through with its raw
@@ -2458,7 +2589,7 @@ always @(posedge clk) begin
 							a_t <= T_INF;
 							a_s <= a_s ^ b_s;
 							a_m <= b_m;
-							fst <= F_WB;
+							begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 						end
 						else if (a_t == T_ZERO) begin
 							// finite dividend / zero: DZ + created infinity
@@ -2468,12 +2599,12 @@ always @(posedge clk) begin
 							a_m <= 64'd0;
 							fpsr[10] <= 1;
 							fpsr[4] <= 1;
-							fst <= F_WB;
+							begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 						end
 						else if (b_t == T_ZERO || a_t == T_INF) begin
 							a_t <= T_ZERO;
 							a_s <= a_s ^ b_s;
-							fst <= F_WB;
+							begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 						end
 						else begin
 							a_s <= a_s ^ b_s;
@@ -2485,7 +2616,7 @@ always @(posedge clk) begin
 								a_m <= (am_eff == 64'h8000_0000_0000_0000) ? bm_eff :
 								       64'h8000_0000_0000_0000;
 								grs <= 0;
-								fst <= F_ROUND;
+								begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 							end
 							else begin
 								// remainder = dividend (chopped for FSGLDIV,
@@ -2493,7 +2624,7 @@ always @(posedge clk) begin
 								acc_hi <= {1'b0, bm_eff};
 								qv <= 0;
 								loop_n <= 0;
-								fst <= F_DIVL;
+								begin fst <= F_DIVL; wb_r <= (F_DIVL == F_WB); acc_r <= 1'b1; end
 							end
 						end
 					end
@@ -2502,36 +2633,28 @@ always @(posedge clk) begin
 			end
 
 			F_ADDX: begin : f_addx
-				reg [67:0] sum;
 				reg [66:0] diff;
 				if (!eff_sub) begin
-					sum = {1'b0, b_m, 3'd0} + {1'b0, sh_v};
-					if (sum[67]) begin
-						a_m <= sum[67:4];
-						grs <= {sum[3], sum[2], sum[1] | sum[0]};
-						e_w <= e_w + 18'sd1;
-					end
-					else begin
-						a_m <= sum[66:3];
-						grs <= sum[2:0];
-					end
+					a_m <= rn_m;
+					grs <= rn_g;
+					if (rn_hi) e_w <= e_w + 18'sd1;
 					a_s <= b_s;
 					a_t <= T_NUM;
-					fst <= F_ROUND;
+					begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 				end
 				else begin
 					diff = {b_m, 3'd0} - sh_v;
 					if (diff == 67'd0) begin
 						a_t <= T_ZERO;
 						a_s <= (rnd_mode == 2'b10);
-						fst <= F_WB;
+						begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 					end
 					else begin
 						a_s <= b_s;
 						a_t <= T_NUM;
 						acc_hi <= {1'b0, diff[66:3]};
 						grs <= diff[2:0];
-						fst <= F_NORM2;
+						begin fst <= F_NLZ; wb_r <= 1'b0; nz_ret <= F_NORM2; acc_r <= 1'b1; end
 						nsel <= 2'b10;
 					end
 				end
@@ -2540,19 +2663,19 @@ always @(posedge clk) begin
 			F_NORM2: begin
 				if (acc_hi[63:0] == 64'd0 && grs == 3'd0) begin
 					a_t <= T_ZERO;
-					fst <= F_WB;
+					begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 				end
-				else if (norm_lz == 7'd64) begin
+				else if (nlz_q == 7'd64) begin
 					a_m <= {grs, 61'd0};
 					grs <= 0;
 					e_w <= e_w - 18'sd64;
-					fst <= F_ROUND;
+					begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 				end
 				else begin
 					a_m <= norm_shifted[66:3];
 					grs <= norm_shifted[2:0];
-					e_w <= e_w - {11'd0, norm_lz};
-					fst <= F_ROUND;
+					e_w <= e_w - {11'd0, nlz_q};
+					begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 				end
 			end
 
@@ -2560,17 +2683,11 @@ always @(posedge clk) begin
 				if (loop_n == 7'd2) begin : mul_fin
 					// mul_pd is the registered full 128-bit product, exactly
 					// the value the former 32-cycle radix-4 loop accumulated.
-					if (mul_pd[127]) begin
-						a_m <= mul_pd[127:64];
-						grs <= {mul_pd[63], mul_pd[62], (mul_pd[61:0] != 0)};
-						e_w <= e_w + 18'sd1;
-					end
-					else begin
-						a_m <= mul_pd[126:63];
-						grs <= {mul_pd[62], mul_pd[61], (mul_pd[60:0] != 0)};
-					end
+					a_m <= rn_m;
+					grs <= rn_g;
+					if (rn_hi) e_w <= e_w + 18'sd1;
 					a_t <= T_NUM;
-					fst <= F_ROUND;
+					begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 				end
 				else begin
 					// the 64x64 DSP product (it replaced a 32-cycle radix-4
@@ -2583,17 +2700,11 @@ always @(posedge clk) begin
 
 			F_DIVL: begin : f_divl
 				if (loop_n == 7'd34) begin
-					if (qv[66]) begin
-						a_m <= qv[66:3];
-						grs <= {qv[2], qv[1], qv[0] | (acc_hi != 65'd0)};
-					end
-					else begin
-						a_m <= qv[65:2];
-						grs <= {qv[1], qv[0], (acc_hi != 65'd0)};
-						e_w <= e_w - 18'sd1;
-					end
+					a_m <= rn_m;
+					grs <= rn_g;
+					if (!rn_hi) e_w <= e_w - 18'sd1;
 					a_t <= T_NUM;
-					fst <= F_ROUND;
+					begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 				end
 				else if (loop_n == 7'd0) begin
 					// the integer quotient bit compares unshifted (the
@@ -2612,10 +2723,10 @@ always @(posedge clk) begin
 
 			F_SQRTL: begin : f_sqrtl
 				if (loop_n == 7'd33) begin
-					a_m <= qv[65:2];
-					grs <= {qv[1], qv[0], (srem != 69'd0)};
+					a_m <= rn_m;
+					grs <= rn_g;
 					a_t <= T_NUM;
-					fst <= F_ROUND;
+					begin fst <= F_ROUND; wb_r <= (F_ROUND == F_WB); acc_r <= 1'b1; end
 				end
 				else begin
 					// two result digits per cycle (66 = 2 x 33)
@@ -2628,12 +2739,20 @@ always @(posedge clk) begin
 
 			F_ROUND: begin : f_round
 				reg [64:0] mr, mi;
-				reg [63:0] rmask, rinc;      // the precision's kept bits and its ulp
+				reg [63:0] rmask;            // the precision's kept bits
 				reg        inx, up, ovf, unf, tomax;
 				reg [1:0]  pr;
 				reg signed [17:0] er, emin, emax;
 				pr = prec_of(r_op);
-				if (a_t != T_NUM) fst <= F_WB;
+				// a move started here (mv_st): its exception shadow, the
+				// one form from the working registers (as F_BIN and F_EXEC
+				// record theirs), for every source format
+				if (mv_st) begin
+					sh_src  <= {a_s, a_e[14:0], 16'd0, a_m};
+					sh_stag <= r_stag;
+					mv_st   <= 1'b0;
+				end
+				if (a_t != T_NUM) begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 				else begin
 					case (pr)
 						2'd1: begin
@@ -2641,26 +2760,23 @@ always @(posedge clk) begin
 							              (a_m[38:0] != 0) || (grs != 0), a_s);
 							inx = (a_m[39:0] != 0) || (grs != 0);
 							rmask = 64'hFFFF_FF00_0000_0000;
-							rinc  = 64'h0000_0100_0000_0000;
 						end
 						2'd2: begin
 							up = round_up(a_m[11], a_m[10],
 							              (a_m[9:0] != 0) || (grs != 0), a_s);
 							inx = (a_m[10:0] != 0) || (grs != 0);
 							rmask = 64'hFFFF_FFFF_FFFF_F800;
-							rinc  = 64'h0000_0000_0000_0800;
 						end
 						default: begin
 							up = round_up(a_m[0], grs[2], grs[1:0] != 0, a_s);
 							inx = (grs != 0);
 							rmask = 64'hFFFF_FFFF_FFFF_FFFF;
-							rinc  = 64'h0000_0000_0000_0001;
 						end
 					endcase
 					// one incrementer for the three precisions, formed beside
 					// the rounding decision (which only selects it): the
 					// sticky compare and the carry chain are not in series
-					mi = {1'b0, a_m & rmask} + {1'b0, rinc};
+					mi = rd_mi;           // rd_pr is pr here
 					mr = up ? mi : {1'b0, a_m & rmask};
 					er = (up && mi[64]) ? (e_w + 18'sd1) : e_w;
 					if (mr[64]) mr = {2'b01, 63'd0};
@@ -2686,12 +2802,29 @@ always @(posedge clk) begin
 					// (decided for the exponent with and without the rounding
 					// carry side by side, the carry selecting: a timing path)
 					ovf = (up && mi[64]) ? (e_w >= emax) : (e_w > emax);
-					unf = (up && mi[64]) ? (e_w + 18'sd1 < emin) : (e_w < emin);
+					// underflow from the intermediate result, before rounding
+					// (9.7.5: checked for underflow, then rounded; softfloat's
+					// roundAndPackFloatx80: zExp < expOffset + 1): a rounding
+					// carry into the normal range does not undo it
+					unf = (e_w < emin);
 					// WBTEMP capture for a possible BUSY frame: rounded for
-					// OVFL and the plain inexact path, unrounded for UNFL
+					// OVFL and the plain inexact path, unrounded for UNFL --
+					// the intermediate before rounding, its exponent with its
+					// significand (table 9-16): not the exponent a rounding
+					// carry raised
+					// -- for OVFL and INEX of the five arithmetic ops (the E3
+					// frame) WinUAE's getFloatInternalRoundedSome: the
+					// precision's kept bits rounded (the exponent with a
+					// rounding carry), the bits below them the unrounded
+					// significand's, one up when the rounding went up (table
+					// 9-16: INEX's intermediate before rounding).  For FMOVE
+					// to a register, FABS and FNEG it is the E1 frame's FPTEMP
+					// instead: the unrounded extended intermediate (WinUAE
+					// getFloatInternalFloatx80)
 					wb_s   <= a_s;
-					wb_e   <= er[16:0];
-					wb_m   <= unf ? a_m : mr[63:0];
+					wb_e   <= (unf || !arith5(r_op)) ? e_w[16:0] : er[16:0];
+					wb_m   <= (unf || !arith5(r_op)) ? a_m :
+					          ((mr[63:0] & rd_mask) | ({24'd0, up ? (a_m[39:0] + 40'd1) : a_m[39:0]} & ~rd_mask));
 					wb_grs <= grs;
 					if (ovf) begin
 						fpsr[12] <= 1;              // OVFL
@@ -2715,7 +2848,7 @@ always @(posedge clk) begin
 							a_t <= T_INF;
 							a_m <= 64'd0;   // created infinity: all-zero
 						end
-						fst <= F_WB;
+						begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 					end
 					else if (unf) begin : f_unf
 						// Gradual underflow.  At single or double rounding
@@ -2729,7 +2862,12 @@ always @(posedge clk) begin
 						// exponent throughout), which this implementation
 						// does not have; those flush to zero.
 						reg signed [17:0] extra;
-						extra = emin - er;
+						// the UNROUNDED significand (a_m, grs) is shifted:
+						// by its own exponent, not one a carry of the
+						// precision's rounding raised (9.7.5: denormalize,
+						// then round) -- emin - er shifted a carried result
+						// a bit too little and doubled it
+						extra = emin - e_w;
 						fpsr[11] <= 1;              // UNFL status (tiny)
 						// accrued UNFL is only recorded when the result is
 						// ALSO inexact (updateaccrued: UNFL && INEX2); the
@@ -2787,7 +2925,7 @@ always @(posedge clk) begin
 								end
 							end
 							else a_t <= T_ZERO;
-							fst <= F_WB;
+							begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 						end
 						else begin
 							sh_v <= {a_m, grs};
@@ -2795,7 +2933,7 @@ always @(posedge clk) begin
 							e_w <= emin;
 							r_pr <= pr;
 							sh_ret <= F_UNFL;
-							fst <= F_SHR;
+							begin fst <= F_SHR; wb_r <= (F_SHR == F_WB); acc_r <= 1'b0; end
 						end
 					end
 					else begin
@@ -2811,7 +2949,7 @@ always @(posedge clk) begin
 						end
 						a_m <= mr[63:0];
 						a_e <= er[16:0];
-						fst <= F_WB;
+						begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 					end
 				end
 			end
@@ -2822,14 +2960,20 @@ always @(posedge clk) begin
 				reg [83:0] du;
 				if (|(fpsr[15:8] & fpcr[15:8])) begin
 					// Enabled exceptions suppress architectural destination
-					// writeback.  The core builds the normal arithmetic-
-					// exception stack frame for the selected vector.
+					// writeback (fr_wb_we, fr_valid below).  The core builds
+					// the normal arithmetic-exception stack frame for the
+					// selected vector.  The condition codes are still set
+					// from the default result that is not written, as for
+					// a completed operation: WinUAE (the oracle) sets them in
+					// fp_arithmetic before fpsr_check_arithmetic_exception,
+					// and the 68060 does the same (Motorola's ftest.sa:
+					// FPSR $09004080 after FADD.B #2,FP0 with FP0 a negative
+					// SNAN); the M68040FPSP's enabled SNAN/OPERR exits leave
+					// the user FPSR as the hardware set it.
 					exc_req <= 1;
 					exc_vec <= fp_exception_vector(fpsr[15:8] & fpcr[15:8]);
-					fpu_used <= 1;
-					fst <= F_IDLE;
 				end
-				else if (r_op == 7'h38) begin : f_cmp
+				if (r_op == 7'h38) begin : f_cmp
 					// FCMP: condition codes from FPn - source
 					du = {b_s, b_e, b_m, b_t};
 					ds = du[83];
@@ -2885,7 +3029,7 @@ always @(posedge clk) begin
 					// in a_m: created infinities carry all-zero bits and
 					// pass-through infinities keep the operand's raw image
 					// (inf_clear_intbit is a 68060 flag, not 68040).
-					fr_valid[r_dst] <= 1;
+					if (!(|(fpsr[15:8] & fpcr[15:8]))) fr_valid[r_dst] <= 1;
 					fpsr[27:24] <= {a_s,
 					                (a_t == T_ZERO),
 					                (a_t == T_INF),
@@ -2893,7 +3037,7 @@ always @(posedge clk) begin
 				end
 				fpu_used <= 1;
 				if (!(|(fpsr[15:8] & fpcr[15:8]))) done <= 1;
-				fst <= F_IDLE;
+				begin fst <= F_IDLE; wb_r <= (F_IDLE == F_WB); acc_r <= 1'b0; end
 			end
 
 			F_SHR: begin : f_shr
@@ -2903,14 +3047,14 @@ always @(posedge clk) begin
 				// steps composed to the same)
 				if (sh_cnt != 0) sh_v <= shr_out;
 				sh_cnt <= 7'd0;
-				fst    <= sh_ret;
+				begin fst <= sh_ret; wb_r <= (sh_ret == F_WB); acc_r <= acc_of(sh_ret); end
 			end
 
 			F_PACKI: begin : f_packi
 				// round and range check the integer store
-				reg  [64:0] iv;
-				reg signed [64:0] sv;
-				reg         ovf;
+				reg  [64:0] mg;
+				reg  [31:0] lo;
+				reg         ovf, hi32, hi16, hi8;
 				if (sh_cnt == 7'd127) begin
 					// infinity / far out of range: OPERR, saturating to the
 					// SIGN-DEPENDENT extreme (roundAndPackInt32/16/8)
@@ -2921,17 +3065,16 @@ always @(posedge clk) begin
 					                            (pk_neg ? {8'h80, 24'd0} : {8'h7F, 24'd0}), 64'd0};
 				end
 				else begin
-					iv = {1'b0, sh_v[66:3]} +
-					     {64'd0, round_up(sh_v[3], sh_v[2],
-					                      (sh_v[1:0] != 0), pk_neg)};
-					if (pk_neg) iv = 65'd0 - iv;
-					sv = $signed(iv);
-					case (pk_isz)
-						2'd2: ovf = (sv > 65'sd2147483647) ||
-						            (sv < -65'sd2147483648);
-						2'd1: ovf = (sv > 65'sd32767) || (sv < -65'sd32768);
-						default: ovf = (sv > 65'sd127) || (sv < -65'sd128);
-					endcase
+					// the rounded magnitude; its range checked as it is (an
+					// n-bit signed result holds below 2^(n-1), or exactly
+					// 2^(n-1) when negative), and only the low long word
+					// negated for the store
+					mg = round_up(sh_v[3], sh_v[2], (sh_v[1:0] != 0), pk_neg) ? shk_i : shk;
+					lo = pk_neg ? (32'd0 - mg[31:0]) : mg[31:0];
+					hi32 = (mg[64:32] != 0) || (mg[31] && !(pk_neg && mg[30:0] == 0));
+					hi16 = (mg[64:16] != 0) || (mg[15] && !(pk_neg && mg[14:0] == 0));
+					hi8  = (mg[64:8]  != 0) || (mg[7]  && !(pk_neg && mg[6:0]  == 0));
+					ovf = (pk_isz == 2'd2) ? hi32 : (pk_isz == 2'd1) ? hi16 : hi8;
 					if (ovf) begin
 						fpsr[13] <= 1;                   // OPERR
 						fpsr[7]  <= 1;
@@ -2940,9 +3083,9 @@ always @(posedge clk) begin
 						                            (pk_neg ? {8'h80, 24'd0} : {8'h7F, 24'd0}), 64'd0};
 					end
 					else begin
-						dout <= {(pk_isz == 2'd2) ? iv[31:0] :
-						         (pk_isz == 2'd1) ? {iv[15:0], 16'd0} :
-						                            {iv[7:0], 24'd0}, 64'd0};
+						dout <= {(pk_isz == 2'd2) ? lo :
+						         (pk_isz == 2'd1) ? {lo[15:0], 16'd0} :
+						                            {lo[7:0], 24'd0}, 64'd0};
 						if (sh_v[2:0] != 0) begin
 							fpsr[9] <= 1;                // INEX2
 							fpsr[3] <= 1;                // accrued INEX
@@ -2950,7 +3093,7 @@ always @(posedge clk) begin
 					end
 				end
 				fpu_used <= 1;
-				if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
+				if (fpcr[15:8] == 8'd0) begin done <= 1; begin fst <= F_IDLE; wb_r <= (F_IDLE == F_WB); acc_r <= 1'b0; end end else begin fst <= F_STDONE; wb_r <= (F_STDONE == F_WB); acc_r <= 1'b0; end  // no enabled exception possible: done now
 			end
 
 			F_UNFL: begin : f_unfl
@@ -2959,30 +3102,31 @@ always @(posedge clk) begin
 				// exponent, which the shift in F_SHR has already scaled the
 				// significand to.
 				reg [64:0] mr, mk, mi;
+				reg [63:0] rmask;
 				reg        up, inx2;
 				if (r_pr == 2'd0) begin
 					up = round_up(sh_v[3], sh_v[2],
 					              (sh_v[1:0] != 0), a_s);
 					inx2 = (sh_v[2:0] != 0);
-					mk = {1'b0, sh_v[66:3]};
-					mi = mk + 65'd1;
+					rmask = 64'hFFFF_FFFF_FFFF_FFFF;
 				end
 				else if (r_pr == 2'd1) begin
 					up = round_up(sh_v[43], sh_v[42],
 					              (sh_v[41:0] != 0), a_s);
 					inx2 = (sh_v[42:0] != 0);
-					mk = {1'b0, sh_v[66:3] & 64'hFFFF_FF00_0000_0000};
-					mi = mk + 65'h100_0000_0000;
+					rmask = 64'hFFFF_FF00_0000_0000;
 				end
 				else begin
 					up = round_up(sh_v[14], sh_v[13],
 					              (sh_v[12:0] != 0), a_s);
 					inx2 = (sh_v[13:0] != 0);
-					mk = {1'b0, sh_v[66:3] & 64'hFFFF_FFFF_FFFF_F800};
-					mi = mk + 65'h800;
+					rmask = 64'hFFFF_FFFF_FFFF_F800;
 				end
-				// the increment is formed beside the rounding decision,
-				// which only selects it (a timing path)
+				// the increment (the shared incrementer, shk_i) is formed
+				// beside the rounding decision, which only selects it (a
+				// timing path)
+				mk = {1'b0, sh_v[66:3] & rmask};
+				mi = {shk_i[64], shk_i[63:0] & rmask};
 				mr = up ? mi : mk;
 				if (inx2) begin
 					fpsr[9] <= 1;                   // INEX2
@@ -2997,43 +3141,32 @@ always @(posedge clk) begin
 				// minimum exponent, matching softfloat's packFloatx80 of
 				// (expOffset + 1).  Rounding that carries into the integer
 				// bit has reached the next exponent up either way.
-				if (mr[64]) begin
+				// (the class and exponent decided beside the rounding: an
+				// incremented significand that does not carry out is never
+				// zero, so the result is zero only unrounded with mk zero)
+				if (up && mi[64]) begin
 					a_m <= 64'h8000_0000_0000_0000;
 					a_e <= e_w[16:0] + 17'd1;
-					fst <= F_WB;
+					begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 				end
 				else begin
 					// (a zero takes a_m = 0 as well: the zero test only
 					// decides the class and exponent)
 					a_m <= mr[63:0];
-					if (mr[63:0] == 64'd0) a_t <= T_ZERO;
-					else a_e <= (mr[63] || e_w != 18'sd1) ? e_w[16:0] : 17'd0;
-					fst <= F_WB;
+					if (!up && mk[63:0] == 64'd0) a_t <= T_ZERO;
+					else a_e <= ((up ? mi[63] : mk[63]) || e_w != 18'sd1) ? e_w[16:0] : 17'd0;
+					begin fst <= F_WB; wb_r <= (F_WB == F_WB); acc_r <= 1'b0; end
 				end
 			end
 
 			F_PACKS: begin : f_packs
 				// Finish a single/double denormal after the staged shift.
 				// A carry from the fraction becomes the minimum normal.
-				reg [24:0] ms;
-				reg [53:0] md;
-				reg inx, tiny;
-				if (r_fmt == 3'd1) begin
-					inx = sh_v[42:0] != 0;
-					ms = {1'b0, sh_v[66:43]} +
-					     {24'd0, round_up(sh_v[43], sh_v[42],
-					                      sh_v[41:0] != 0, a_s)};
-					tiny = !ms[23];
-					dout <= {a_s, 7'd0, ms[23], ms[22:0], 64'd0};
-				end
-				else begin
-					inx = sh_v[13:0] != 0;
-					md = {1'b0, sh_v[66:14]} +
-					     {53'd0, round_up(sh_v[14], sh_v[13],
-					                      sh_v[12:0] != 0, a_s)};
-					tiny = !md[52];
-					dout <= {a_s, 10'd0, md[52], md[51:0], 32'd0};
-				end
+				// (sd_out packs the rounded shifted significand: its
+				// integer bit is the exponent field's lowest)
+				reg inx;
+				inx = sd_isS ? (sh_v[42:0] != 0) : (sh_v[13:0] != 0);
+				dout <= sd_out;
 				// Tininess is detected BEFORE rounding.  Reaching F_PACKS
 				// already means the value is below this precision's
 				// minimum normal exponent (the sE < -126 / -1022 test at
@@ -3055,7 +3188,7 @@ always @(posedge clk) begin
 					fpsr[5] <= 1;                 // accrued UNFL
 				end
 				fpu_used <= 1;
-				if (fpcr[15:8] == 8'd0) begin done <= 1; fst <= F_IDLE; end else fst <= F_STDONE;  // no enabled exception possible: done now
+				if (fpcr[15:8] == 8'd0) begin done <= 1; begin fst <= F_IDLE; wb_r <= (F_IDLE == F_WB); acc_r <= 1'b0; end end else begin fst <= F_STDONE; wb_r <= (F_STDONE == F_WB); acc_r <= 1'b0; end  // no enabled exception possible: done now
 			end
 
 			F_STDONE: begin
@@ -3073,10 +3206,10 @@ always @(posedge clk) begin
 					exc_req <= 1;
 					exc_vec <= fp_exception_vector(fpsr[15:8] & fpcr[15:8]);
 				end
-				fst <= F_IDLE;
+				begin fst <= F_IDLE; wb_r <= (F_IDLE == F_WB); acc_r <= 1'b0; end
 			end
 
-			default: fst <= F_IDLE;
+			default: begin fst <= F_IDLE; wb_r <= (F_IDLE == F_WB); acc_r <= 1'b0; end
 		endcase
 	end
 end

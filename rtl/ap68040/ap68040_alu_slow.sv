@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP68040-60 - pipelined MC68040                                            //
+// AP68040 - pipelined MC68040                                            //
 //                                                                          //
 // ap68040_alu_slow.sv - EX-stage two-cycle integer unit: shifts and        //
 // rotates, BCD, PACK/UNPK.  Its outputs are registered by the back end     //
@@ -12,13 +12,22 @@ module ap68040_alu_slow
 	import ap68040_pkg::*;
 (
 	input  logic  [6:0] op,
+	// the shift's kind, one-hot, decoded from op as the uop enters EX and
+	// registered (the funnel's amount and input selects start from these
+	// flip-flops, not from a decode of op): ASL LSL ASR LSR ROL ROR ROXL ROXR
+	input  logic  [7:0] shk,
 	input  logic  [1:0] sz,
 	input  logic [31:0] a,
 	input  logic [31:0] b,
 	input  logic  [5:0] cnt,        // shift count: a[5:0], without a's mux
+	input  logic  [5:0] nx_q,       // ROXL/ROXR: the count mod (size + 1), registered
+	output logic  [5:0] nx,         // ... formed here from cnt (for that register)
+	input  logic  [6:0] nxl_q,      // ROXL: the funnel's amount, size + 1 - nx, registered
+	output logic  [6:0] nxl,        // ... formed here from nx (for that register)
 	input  logic  [4:0] flags_in,   // X N Z V C
 	output logic [31:0] res,
-	output logic  [4:0] flags_out
+	output logic  [4:0] flags_out,
+	output logic        sim_c       // (simulation: the carry as the funnel forms it)
 );
 
 wire f_x = flags_in[4];
@@ -99,11 +108,14 @@ logic [65:0] rv, ro;
 logic  [6:0] ra;
 logic [65:0] lo;
 always_comb begin
-	logic [33:0] seg;
-	logic [33:0] therm;
+	logic [31:0] yv, tm;
+	logic        vl;
 	sh_n  = cnt;
 	sh_nm = sh_n & (nbits - 6'd1);
-	// n mod (size + 1) for ROXL/ROXR by subtracting multiples (no divider)
+	// n mod (size + 1) for ROXL/ROXR by subtracting multiples (no divider):
+	// formed here (nx), registered by the back end in a cycle of its own,
+	// and used from that register (nx_q) -- the subtractions stay off the
+	// shifter's path
 	sh_nx = sh_n;
 	case (nbits)
 		6'd8: begin
@@ -117,83 +129,119 @@ always_comb begin
 		end
 		default: if (sh_nx >= 6'd33) sh_nx = sh_nx - 6'd33;
 	endcase
+	nx    = sh_nx;
+	// ROXL's funnel amount, size + 1 - the count, formed with the count
+	// (its subtraction in the pre-cycle too, off the funnel's path)
+	nxl   = (sh_nx == 6'd0) ? 7'd0 : ({1'b0, nbits} + 7'd1 - {1'b0, sh_nx});
+	sh_nx = nx_q;
 	// the right funnel's input and count.  A rotate's input repeats its
 	// period P from bit 0 ({P, P}): shifted right by k (< the period), its
 	// low bits are P rotated right by k
-	case (op)
-		OP_ASR:  begin
-			rv = {{34{b_msb}}, bm, 1'b0};
-			case (sz)
-				SZ_B:    rv[65:9]  = {57{b_msb}};
-				SZ_W:    rv[65:17] = {49{b_msb}};
-				default: ;
-			endcase
-			ra = {1'b0, sh_n};
-		end
-		OP_ROL, OP_ROR: begin
-			case (sz)
-				SZ_B:    rv = {50'd0, bm[7:0], bm[7:0]};
-				SZ_W:    rv = {34'd0, bm[15:0], bm[15:0]};
-				default: rv = {2'd0, bm, bm};
-			endcase
-			ra = (op == OP_ROR) ? {1'b0, sh_nm} : {1'b0, (nbits - sh_nm) & (nbits - 6'd1)};
-		end
-		OP_ROXL, OP_ROXR: begin
-			case (sz)
-				SZ_B:    rv = {48'd0, f_x, bm[7:0], f_x, bm[7:0]};
-				SZ_W:    rv = {32'd0, f_x, bm[15:0], f_x, bm[15:0]};
-				default: rv = {f_x, bm, f_x, bm};
-			endcase
-			ra = (op == OP_ROXR) ? {1'b0, sh_nx}
-			                     : ((sh_nx == 6'd0) ? 7'd0 : ({1'b0, nbits} + 7'd1 - {1'b0, sh_nx}));
-		end
-		default: begin   // LSR
-			rv = {33'd0, bm, 1'b0};
-			ra = {1'b0, sh_n};
-		end
-	endcase
-	ro = (op == OP_ASR) ? 66'($signed(rv) >>> ra) : (rv >> ra);
-	lo = {34'd0, bm} << sh_n;
-	// ASL: the bits shifted out and the new sign bit must all be equal
-	case (sz)
-		SZ_B:    seg = lo[40:7];
-		SZ_W:    seg = lo[48:15];
-		default: seg = lo[64:31];
-	endcase
-	therm = (34'd2 << sh_n) - 34'd1;
+	if (shk[2]) begin               // ASR
+		rv = {{34{b_msb}}, bm, 1'b0};
+		case (sz)
+			SZ_B:    rv[65:9]  = {57{b_msb}};
+			SZ_W:    rv[65:17] = {49{b_msb}};
+			default: ;
+		endcase
+		ra = {1'b0, sh_n};
+	end
+	else if (shk[4] || shk[5]) begin    // ROL, ROR
+		case (sz)
+			SZ_B:    rv = {50'd0, bm[7:0], bm[7:0]};
+			SZ_W:    rv = {34'd0, bm[15:0], bm[15:0]};
+			default: rv = {2'd0, bm, bm};
+		endcase
+		// ROL by k: the doubled operand shifted right by size - 1 - k
+		// (the count's complement within the size: no subtraction) and
+		// taken one bit up (ro[32:1], as a right shift's result)
+		ra = shk[5] ? {1'b0, sh_nm} : {1'b0, ~sh_nm & (nbits - 6'd1)};
+	end
+	else if (shk[6] || shk[7]) begin    // ROXL, ROXR
+		case (sz)
+			SZ_B:    rv = {48'd0, f_x, bm[7:0], f_x, bm[7:0]};
+			SZ_W:    rv = {32'd0, f_x, bm[15:0], f_x, bm[15:0]};
+			default: rv = {f_x, bm, f_x, bm};
+		endcase
+		ra = shk[7] ? {1'b0, sh_nx} : nxl_q;
+	end
+	else if (shk[0] || shk[1]) begin    // ASL, LSL
+		// a left shift through the same funnel: the operand above 31
+		// zeros, shifted right by 31 - n (the count inverted, no
+		// subtraction), is the operand shifted left by n; n >= 32
+		// shifts everything out (C of a long shifted by 32: below)
+		rv = {3'd0, bm, 31'd0};
+		ra = sh_n[5] ? 7'd127 : {2'd0, ~sh_n[4:0]};
+	end
+	else begin                          // LSR
+		rv = {33'd0, bm, 1'b0};
+		ra = {1'b0, sh_n};
+	end
+	ro = shk[2] ? 66'($signed(rv) >>> ra) : (rv >> ra);
+	lo = ro;                      // (ASL, LSL: the operand shifted left by n)
+	// ASL: V when the bits shifted out and the new sign bit are not all
+	// equal, i.e. the top count+1 bits of the operand (at the size) differ
+	// somewhere: an adjacent pair among them differs.  yv[i] = x[i] ^ x[i-1],
+	// tm marks the top count positions; no shifter on the path
+	yv = bm ^ {bm[30:0], 1'b0};
+	for (int i = 0; i < 32; i++)
+		tm[i] = (6'(i) < nbits) && ((nbits - 6'd1 - 6'(i)) < sh_n);
+	vl = (yv & tm) != 32'd0;
 	sh_r = bm;
-	sh_c = 1'b0;
-	sh_x = f_x;
 	sh_v = 1'b0;
 	if (sh_n != 6'd0) begin
+		if (shk[0] || shk[1]) begin         // ASL, LSL
+			sh_r = lo[31:0] & szmask;
+			if (shk[0])
+				sh_v = (sh_n >= nbits) ? (bm != 0) : vl;
+		end
+		else if (shk[3] || shk[2] || shk[4]) sh_r = ro[32:1] & szmask;   // LSR, ASR, ROL
+		else sh_r = ro[31:0] & szmask;      // ROR, ROXL, ROXR
+	end
+	// The carry (the last bit moved out) and X come from the operand bit
+	// at that step's index -- one 32:1 multiplexer on the operand, the
+	// index a subtraction from the count -- not from the funnel: C and X
+	// are needed in the op's first cycle (N and Z come from the registered
+	// result in the second), and the funnel with the flag multiplexers
+	// behind it does not close at 60 MHz.  The funnel's own carry (sim_c)
+	// is checked against it in simulation.
+	//   LSL/ASL by n (1..size):  bit size-n;  n > size: 0
+	//   LSR by n:                bit n-1;     n > size: 0;  ASR: the sign
+	//   ROL by k = n mod size:   bit size-k (k = 0: bit 0)
+	//   ROR by k:                bit k-1     (k = 0: bit size-1)
+	//   ROXL by m = n mod (size+1): bit size-m;  ROXR: bit m-1;  m = 0: X
+	//   count 0: C = 0 (ROXL/ROXR: X); X unchanged (shifts: X = C)
+	begin : direct_c
+		logic [5:0] ck, ci;
+		logic       left, rox, rot, c_bit;
+		rox  = shk[6] || shk[7];
+		rot  = shk[4] || shk[5];
+		left = shk[0] || shk[1] || shk[4] || shk[6];
+		ck   = rox ? sh_nx : rot ? sh_nm : sh_n;
+		ci   = left ? (nbits - ck) : (ck - 6'd1);
+		if (rot && sh_nm == 6'd0) ci = shk[4] ? 6'd0 : (nbits - 6'd1);
+		c_bit = bm[ci[4:0]];
+		if (sh_n == 6'd0)             sh_c = rox ? f_x : 1'b0;
+		else if (rox)                 sh_c = (sh_nx == 6'd0) ? f_x : c_bit;
+		else if (rot)                 sh_c = c_bit;
+		else if (sh_n > nbits)        sh_c = shk[2] ? b_msb : 1'b0;
+		else                          sh_c = c_bit;
+		sh_x = (sh_n != 6'd0 && !rot) ? sh_c : f_x;
+	end
+end
+// (simulation) the carry from the funnel, the form the direct one replaces
+always_comb begin
+	sim_c = 1'b0;
+	if (sh_n != 6'd0) begin
 		case (op)
-			OP_ASL, OP_LSL: begin
-				sh_r = lo[31:0] & szmask;
-				sh_c = (sh_n <= nbits) && lo[nbits];
-				sh_x = sh_c;
-				if (op == OP_ASL)
-					sh_v = (sh_n >= nbits) ? (bm != 0) : !((seg == 0) || (seg == therm));
-			end
-			OP_LSR, OP_ASR: begin
-				sh_r = ro[32:1] & szmask;
-				sh_c = ro[0];
-				sh_x = sh_c;
-			end
-			OP_ROL, OP_ROR: begin
-				sh_r = ro[31:0] & szmask;
-				sh_c = (op == OP_ROL) ? sh_r[0] : sh_r[nbits - 6'd1];
-			end
-			default: begin   // ROXL, ROXR
-				sh_x = ro[nbits];
-				sh_r = ro[31:0] & szmask;
-				sh_c = sh_x;
-			end
+			OP_ASL, OP_LSL: sim_c = (sh_n <= nbits) && (sh_n[5] ? bm[0] : lo[nbits]);
+			OP_LSR, OP_ASR: sim_c = ro[0];
+			OP_ROL:         sim_c = ro[1];
+			OP_ROR:         sim_c = ro[nbits - 6'd1];
+			default:        sim_c = ro[nbits];   // ROXL, ROXR
 		endcase
 	end
-	else if (op == OP_ROXL || op == OP_ROXR) begin
-		// count 0: C = X, X unchanged
-		sh_c = f_x;
-	end
+	else if (op == OP_ROXL || op == OP_ROXR) sim_c = f_x;
 end
 
 always_comb begin
@@ -211,8 +259,11 @@ always_comb begin
 		OP_PACK: res = {b[31:8], pack_r};
 		OP_UNPK: res = {b[31:16], unpk_r};
 		OP_ASL, OP_ASR, OP_LSL, OP_LSR, OP_ROL, OP_ROR, OP_ROXL, OP_ROXR: begin
+			// (N and Z: the back end forms them from the registered result
+			// in the op's second cycle; nothing of the funnel reaches the
+			// flags here)
 			res = merge(sh_r, b, szmask);
-			flags_out = {sh_x, msb_of(sh_r, sz), (sh_r & szmask) == 32'd0, sh_v, sh_c};
+			flags_out = {sh_x, 1'b0, 1'b0, sh_v, sh_c};
 		end
 		default: ;
 	endcase
