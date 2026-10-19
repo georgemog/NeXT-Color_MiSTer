@@ -530,6 +530,17 @@ ap68040_atc #(.SAME_SEARCH(0), .EXT_SET(1)) datc (
 //--------------------------------------------------------------------------
 // translation and cache tag compare of a lookup
 //--------------------------------------------------------------------------
+// NeXT-Color: AP68040_DC_WRITETHROUGH makes every copyback page write-
+// through (CM 01 -> 00), keeping memory current for DMA reads, which the
+// platform does not snoop.
+function automatic logic [1:0] cm_eff(input logic [1:0] cm);
+`ifdef AP68040_DC_WRITETHROUGH
+	cm_eff = (cm == 2'b01) ? 2'b00 : cm;
+`else
+	cm_eff = cm;
+`endif
+endfunction
+
 function automatic xres_t xlate(input logic [31:0] la, input logic s, input logic wr,
                                 input logic alt,
                                 input logic hitv, input atce_t e,
@@ -550,7 +561,7 @@ function automatic xres_t xlate(input logic [31:0] la, input logic s, input logi
 	if (tt0 || tt1) begin
 		x.ok  = 1'b1;
 		x.pa  = la;
-		x.cm  = tt0 ? dtt0[6:5] : dtt1[6:5];
+		x.cm  = cm_eff(tt0 ? dtt0[6:5] : dtt1[6:5]);
 		x.upa = tt0 ? dtt0[9:8] : dtt1[9:8];
 		x.flt = wr && (tt0 ? dtt0[2] : dtt1[2]);
 	end
@@ -2251,7 +2262,7 @@ always_ff @(posedge clk) begin
 				e.g   = tw_pd[10];
 				e.upa = tw_pd[9:8];
 				e.s   = tw_pd[7];
-				e.cm  = tw_pd[6:5];
+				e.cm  = cm_eff(tw_pd[6:5]);
 				e.m   = tw_pd[4];
 				e.w   = tw_wp;
 				e.r   = 1'b1;
