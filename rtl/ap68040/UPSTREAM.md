@@ -6,17 +6,14 @@ MacQuadra800 / wombat33 copy) and its `wombat_cpu` bundle.
 
 ## Where the tree came from
 
-The files are the copy Minimig-AGA's AP68040 build carries (`rtl/ap68040`
-on its `ap040-60mhz-racefix` branch, 2026-10-14):
+Upstream `apolkosnik/AP68040` `main` at `c21d1e8` plus PR #10 (`6d146df`,
+"DMU: a discarded DC2 job keeps its kill mark through a snoop freeze"),
+taken 2026-10-19.  `main` already carries the multiply/divide `md_fin` fix
+and its own fix (`q_flt`) of the fetch-fault decode deadlock that this
+tree's `8aaf25a` fixed for the older `ap68040-60mhz` copy.
 
-| what | commit |
-|---|---|
-| AP68040 `ap68040-60mhz` | `f1b0ff8` (2026-10-11) |
-| + the multiply/divide `md_fin` fix (`minimig-md-fin`) | `a5279fa` (2026-10-14) |
-| + `ap68040.sv` exports `dbg_vbr`, `dbg_cacr`, `dbg_cmaint` | Minimig `9d93ccf` / `68d6000` |
-
-Not copied: Minimig's `ap040_tg68k_compat.v` (the Amiga bus glue) and
-`fastram/` (its DDR3 Fast RAM port).
+Local change: `ap68040.sv` exports `dbg_vbr`, `dbg_cacr` and `dbg_cmaint`
+(as Minimig-AGA's copy does); `rtl/next_ap68040.sv` uses them.
 
 ## The NeXT side
 
@@ -29,9 +26,8 @@ tc_machine's DMA-write snoop strobes into alternate-master SC = 10 snoops
 travel the 68040 bus like any other transfer, so tc_machine's walker port is
 tied off.
 
-Area options: `FPU_PIPE = LOOP_PRED = EARLY_RES = 0`, as Minimig's build
-(about 22.8K ALMs out of context, against ~25.6K in context for the old
-core). `NeXT-Color.qsf` turns register retiming off for the CPU instance and
+Area options: the upstream defaults (`FPU_PIPE`, `LOOP_PRED`, `EARLY_RES`,
+`DC1_ATC`, `SKID` all 0; upstream quotes under 20,000 ALMs out of context). `NeXT-Color.qsf` turns register retiming off for the CPU instance and
 synthesizes it for area.
 
 ## Tests

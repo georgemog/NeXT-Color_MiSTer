@@ -1,5 +1,5 @@
 //--------------------------------------------------------------------------//
-// AP68040-60 - pipelined MC68040                                            //
+// AP68040 - pipelined MC68040                                            //
 //                                                                          //
 // ap68040_backend.sv - AG, DC1, DC2, EX and WB stages                       //
 //                                                                          //
@@ -27,7 +27,9 @@ module ap68040_backend
 #(
 	parameter logic [7:0] FPU_REVISION = 8'h41,   // FSAVE frame revision ($40: 44-byte UNIMP)
 	parameter bit         FPU_PIPE  = 1,
-	parameter bit         EARLY_RES = 1
+	parameter bit         EARLY_RES = 1,
+	parameter bit         SKID      = 1,      // the skid register in front of AG
+	parameter int         DIV_STEPS = 2       // divide steps per cycle
 )(
 	input  logic        clk,
 	input  logic        nreset,
@@ -48,6 +50,7 @@ module ap68040_backend
 
 	// exception entry for the sequencer
 	output logic        exc_go,         // pulse: run the exception routine
+	output logic        exc_pend,       // the entry is being prepared: no uop may issue
 	output logic  [3:0] exc_kind,       // routine selector (see EK_*)
 	output logic  [4:0] exc_ssp,        // supervisor stack register to use
 
@@ -86,7 +89,7 @@ module ap68040_backend
 	output logic        lp_tk,
 	output logic        lp_mp,
 	output logic        dm_noalloc,     // exception stacking / vector fetch
-	output logic        dm_iack,        // interrupt acknowledge cycle
+	output logic  [1:0] dm_ack,         // acknowledge cycle: 1 IACK, 2 BKPT
 	input  logic        dm_hold1,       // the DMU holds DC1
 	// WB maintenance (CINV/CPUSH/PFLUSH/PTEST) in the DMU
 	output logic        mt_v,
@@ -98,7 +101,10 @@ module ap68040_backend
 	output logic        mt_ng,
 	output logic        mt_wr,
 	input  logic        mt_done,
-	input  logic [31:0] mt_mmusr,
+	input  logic [31:0] mt_mmusr,       // PTEST: the MMUSR
+	input  logic        mt_fault,       // CPUSH: a push ended in TEA (an access error)
+	input  logic [15:0] mt_fssw,
+	input  logic [31:0] mt_faddr,
 	output logic        adv_dc1,        // DC1 -> DC2
 	output logic        adv_dc2,        // DC2 -> EX
 	output logic        adv_ex,         // EX -> WB
@@ -110,7 +116,7 @@ module ap68040_backend
 	input  logic        dm_fault,       // DC2 access fault (with info below)
 	input  logic  [7:0] dm_fvec,        // 2 access error, 3 address error
 	input  logic [31:0] dm_faddr,
-	input  logic [15:0] dm_fssw,
+	input  logic [15:0] dm_fssw,        // ... its special status word
 	output logic        dm_st_v,        // WB store data valid this cycle
 	output logic [31:0] dm_st_data,
 	input  logic        dm_st_rdy,      // store accepted (WB may complete)
@@ -125,6 +131,7 @@ module ap68040_backend
 	input  logic        rsto_busy,
 
 	output logic        kill_now,       // this cycle: younger uops are discarded
+	output logic        lk_abandon,     // an open locked sequence is abandoned
 	output logic        adv_ag,         // AG -> DC1
 	output logic [31:0] dtt0,
 	output logic [31:0] dtt1,
@@ -137,16 +144,21 @@ module ap68040_backend
 	// debug
 	output logic [31:0] dbg_pc,
 	output logic        dbg_retire,
-	output logic        halted
+	output logic        halted,
+	output logic        fetch_stop      // no new instruction fetches: stopped
+                                        // (STOP) or halted
 );
+
+// the SR bits the 68040 keeps: T1 T0 S M I2-I0 X N Z V C
+localparam logic [15:0] SR_MASK = 16'hF71F;
 
 //--------------------------------------------------------------------------
 // exception routine kinds (sequencer entry points)
 //--------------------------------------------------------------------------
 localparam logic [3:0] EK_FMT0  = 4'd0;   // format $0 (PC = exc_pc)
-localparam logic [3:0] EK_FMT2  = 4'd1;   // format $2 (+ address)
+localparam logic [3:0] EK_FMT2  = 4'd1;   // format $2 / $3 (+ address)
 localparam logic [3:0] EK_FMT7  = 4'd2;   // access error
-localparam logic [3:0] EK_IRQ   = 4'd3;   // interrupt (IACK + format $0/$1)
+localparam logic [3:0] EK_IRQ   = 4'd3;   // interrupt (IACK + format $0)
 localparam logic [3:0] EK_RESET = 4'd4;   // reset: SSP/PC from 0/4
 localparam logic [3:0] EK_IRQM  = 4'd5;   // interrupt with M set (throwaway frame)
 
@@ -155,6 +167,7 @@ localparam logic [3:0] EK_IRQM  = 4'd5;   // interrupt with M set (throwaway fra
 //--------------------------------------------------------------------------
 logic        ag_v, dc1_v, dc2_v, ex_v, wb_v;
 uop_t        ag_u, dc1_u, dc2_u, ex_u, wb_u;
+logic [31:0] ex_npc, wb_npc;  // EX's and WB's next instruction (pc + 2 ilen)
 
 // operand values carried with the uop
 logic [31:0] dc1_a, dc1_b, dc1_ea;
@@ -186,7 +199,7 @@ logic        wb_exc_fmtv;     // the frame format is wb_exc_fmt (FPU exceptions)
 logic  [3:0] wb_exc_fmt;
 logic        wb_xcommit;      // the uop's address updates stand (FPU unimp/unsupp)
 logic [31:0] wb_exc_addr;
-logic [15:0] wb_exc_ssw;
+logic [15:0] wb_exc_ssw;      // SSW of an access error
 logic        wb_st;           // store at WB
 logic [31:0] wb_st_data;
 logic [15:0] wb_sr_new;       // SR write
@@ -212,7 +225,8 @@ logic [31:0] fv;
 // (ew_same: ex_u.pc == wb_u.pc, kept as the two load -- the compare
 // stays off the FPU's hold, and so the stall chain)
 logic ew_same;
-wire wb_fpchk = wb_v && !wb_u.last && (wb_exc == 8'd0) &&
+logic wb_ok;                  // WB's uop has no exception (wb_exc == 0), registered
+wire wb_fpchk = wb_v && !wb_u.last && wb_ok &&
                 (wb_u.mem == M_NONE || wb_u.mem == M_LD) &&
                 ex_v && ex_u.op == OP_FPU && ew_same;
 // FPU interface outputs (ap68040_fpif)
@@ -224,6 +238,7 @@ logic  [7:0] fp_mvslots;
 logic  [2:0] fp_crslots;
 logic  [4:0] fp_svwords, fp_rswords;
 logic  [2:0] fwe, bwe;
+logic  [1:0] fwe_ag;           // fwe[0..1] without the advance (AG holds an update)
 logic  [4:0] fwa [3], bwa [3];
 logic [31:0] fwd [3], bwd [3];
 logic  [4:0] rra [5];
@@ -240,7 +255,8 @@ logic [31:0] tc_r, itt0_r, itt1_r, dtt0_r, dtt1_r, mmusr_r, urp_r, srp_r;
 logic [31:0] xi_pc, xi_addr;
 logic [15:0] xi_sr, xi_vecw, xi_ssw;
 logic [31:0] xi_vaddr, xi_ea, xi_w3a, xi_w3d;
-logic  [1:0] xw_ph;           // exception entry: back-file writes of T5-T13
+logic        xi_f7;           // the frame is format $7: T5-T7 too
+logic  [2:0] xw_ph;           // exception entry: back-file writes of T5-T13
 
 assign sr   = {sr_r[15:5], ccr_b};
 assign dtt0 = dtt0_r;
@@ -278,7 +294,26 @@ assign adv_dc2 = dc2_v && !stall_dc2;
 assign adv_dc1 = dc1_v && !stall_dc1;
 assign adv_ag  = ag_v  && !stall_ag;
 
-assign in_rdy  = !stall_ag && !flush && !stopped && !eredir_pend;
+// AG's input: a skid register in front of it, so the sequencer's pop does
+// not wait for the stall chain.  The sequencer may pop whenever the skid is
+// empty; a uop it pops that AG cannot take waits in the skid, and AG takes
+// the skid's first.  The register file is read, and the forwarding formed,
+// for the uop entering AG (ain_u), wherever it comes from.
+logic        sk_v;
+// (a copy of sk_v for the register file's read addresses alone: sk_v
+// selects the whole uop, and its fan-out would delay the reads)
+(* preserve *) logic sk_vr;
+uop_t        sk_u;
+wire         ain_v = sk_v || in_v;
+uop_t        ain_u;
+assign ain_u   = sk_v ? sk_u : in_u;
+// (without the skid the sequencer's pop waits for AG: the stall chain)
+assign in_rdy  = (SKID ? !sk_v : !stall_ag) && !flush && !stopped && !eredir_pend && !exc_pend;
+// (the back-file writes of the routine's operands take several cycles
+// after the flush: the sequencer must not issue from the old stream, which
+// the fetch queue still holds, before exc_go)
+assign exc_pend = (xw_ph != 3'd0);
+wire         ag_take = !stall_ag && !stopped && !halted;   // AG loads ain_u
 
 //--------------------------------------------------------------------------
 // AG
@@ -330,9 +365,14 @@ wire ag_interlock = ag_v && (
 
 // the load whose data can be handed over: its result is the data itself
 // (a long MOVE, MOVEA.W sign-extended, a memory-indirect pointer)
-wire        dc2_cap  = adv_dc2 && dc2_u.d_v && dc2_u.op == OP_MOV && dc2_u.cond == 4'd0 &&
+// dc2_capd selects the data; it is marked captured only as the load moves
+// to EX (adv_dc2): AG is interlocked while such a load is in DC2 (pend_dc),
+// so a value taken before the load advances -- not final yet, perhaps -- is
+// replaced when it does; the advance, the end of the stall chain, stays off
+// the data multiplexers
+wire        dc2_capd = dc2_u.d_v && dc2_u.op == OP_MOV && dc2_u.cond == 4'd0 &&
                        dc2_u.mem == M_LD && dc2_u.a_src == OS_MEM && dc2_u.sz == SZ_L &&
-                       dc2_u.exc == 8'd0 && dm_ldata_alv;
+                       dc2_u.exc == 8'd0 && dm_ldata_alv && dc2_v;
 // (from the DMU's aligned word, not its general byte gather: a short path;
 // a misaligned load reaches AG a cycle later, through EX's write)
 wire [31:0] dc2_capv = dc2_u.a_sxw ? {{16{dm_ldata_al[15]}}, dm_ldata_al[15:0]} : dm_ldata_al;
@@ -340,12 +380,24 @@ wire [31:0] dc2_capv = dc2_u.a_sxw ? {{16{dm_ldata_al[15]}}, dm_ldata_al[15:0]} 
 assign ag_hold = ag_interlock;
 
 ap68040_rf #(.NR(5)) rff (.clk(clk), .we(fwe), .wa(fwa), .wd(fwd), .ra(rra), .rd(frd));
-ap68040_rf #(.NR(5)) rfb (.clk(clk), .we(bwe), .wa(bwa), .wd(bwd), .ra(rra), .rd(brd));
+ap68040_rf #(.NR(5), .NW(2)) rfb (.clk(clk), .we(bwe), .wa(bwa), .wd(bwd), .ra(rra), .rd(brd));
 // AG's base and index are read as the uop enters AG (ports 0/1 address
 // the incoming uop) and kept in registers, so AG's address adders, and the
 // data cache's set index after them, start from flip-flops
-assign rra[0] = in_u.base;
-assign rra[1] = in_u.idx;
+assign rra[0] = sk_vr ? sk_u.base : in_u.base;   // (= ain_u's)
+assign rra[1] = sk_vr ? sk_u.idx  : in_u.idx;
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && wb_commit && wb_dwe && wb_u.upd2_v) begin
+		$display("FAIL: a uop with both a register result and upd2 (pc %h): the back file has two write ports", wb_u.pc);
+		$finish;
+	end
+always_ff @(posedge clk)
+	if (nreset && sk_vr != sk_v) begin
+		$display("FAIL: the skid's copy sk_vr %b differs from sk_v %b", sk_vr, sk_v);
+		$finish;
+	end
+// synthesis translate_on
 assign rra[2] = ag_u.upd2_reg;
 assign rra[3] = ag_u.a_reg;
 assign rra[4] = ag_u.b_reg;
@@ -374,7 +426,8 @@ wire        ag_dyncan = (ag_u.dyn == 3'd1 && !fp_mvslots[ag_u.dynk[2:0]]) ||
 wire        ag_cancel = (ag_bft && !(bf_nb == 3'd3 || bf_nb == 3'd5)) ||
                         (ag_rte7 && !rte_fmt7) || ag_dyncan;
 // a continued MOVEM transfers from the stacked EA
-wire        ag_cm     = cm_pend && (ag_u.pc == cm_pc) && (ag_u.mem != M_NONE) &&
+logic       cm_hit_q;          // ag_u.pc == cm_pc, registered
+wire        ag_cm     = cm_pend && cm_hit_q && (ag_u.mem != M_NONE) &&
                         (ag_u.op == OP_MOV) && (ag_u.cond == 4'hC);
 wire  [1:0] ag_msz    = ag_bfh ? ((bf_nb == 3'd1) ? SZ_B : (bf_nb <= 3'd3) ? SZ_W : SZ_L)
                                : ag_u.msz;
@@ -405,7 +458,8 @@ function automatic logic [31:0] opnd(input logic [1:0] src, input logic [4:0] r,
 endfunction
 
 wire [31:0] ag_a = ag_u.a_upd ? ag_updv : opnd(ag_u.a_src, ag_u.a_reg, rrd[3], ag_u.imm, ag_u.a_sxw);
-wire [31:0] ag_b = ag_u.b_upd ? ag_updv : opnd(ag_u.b_src, ag_u.b_reg, rrd[4], ag_u.imm_b, 1'b0);
+wire [31:0] ag_immb = {{15{ag_u.imm_b[16]}}, ag_u.imm_b};   // the B immediate extended
+wire [31:0] ag_b = ag_u.b_upd ? ag_updv : opnd(ag_u.b_src, ag_u.b_reg, rrd[4], ag_immb, 1'b0);
 
 // AG's early result: MOVE, ADD, SUB, AND, OR, EOR and LSL/ASL by an
 // immediate count, from register or immediate operands whose values are
@@ -438,7 +492,7 @@ always_comb begin
 			else ea_ok = 1'b0;
 		end
 	end
-	eb_v  = (ag_u.b_src == OS_REG) ? rrd[4] : (ag_u.b_src == OS_IMM) ? ag_u.imm_b : 32'd0;
+	eb_v  = (ag_u.b_src == OS_REG) ? rrd[4] : (ag_u.b_src == OS_IMM) ? ag_immb : 32'd0;
 	eb_ok = 1'b1;
 	if (ag_u.b_src == OS_REG) begin
 		w = yw(ag_u.b_reg);
@@ -467,8 +521,11 @@ end
 // run ahead into (it predicts calls and returns, beyond the 68040's
 // prefetch): the next instruction to reach AG is refetched, with it
 // everything younger.  Instructions already past AG are in execution.
+// An exception routine's uops are not instructions (their pc is 0): the
+// refetch waits for the handler's first instruction, which the routine's
+// final jump fetches afresh anyway.
 logic snp_pend;
-wire  ag_snref = snp_pend && ag_v && ag_u.first;
+wire  ag_snref = snp_pend && ag_v && ag_u.first && !ag_u.exr;
 always_ff @(posedge clk) begin
 	if (!nreset || flush) snp_pend <= 1'b0;
 	else if (sn_ihit) snp_pend <= 1'b1;
@@ -514,7 +571,8 @@ always_ff @(posedge clk) begin
 end
 assign lp_we = lp_we_q && !flush;
 assign dm_noalloc = (ag_u.mfc == MFC_SUP);
-assign dm_iack    = (ag_u.mfc == MFC_IACK);
+// acknowledge cycles (TT=3): 1 interrupt, 2 breakpoint
+assign dm_ack     = (ag_u.mfc == MFC_IACK) ? 2'd1 : (ag_u.mfc == MFC_BKPT) ? 2'd2 : 2'd0;
 always_comb begin
 	case (ag_u.mfc)
 		MFC_SFC: dm_fc = sfc_r;
@@ -553,9 +611,9 @@ logic [31:0] md_rem;          // remainder / product high, for OP_MDRES
 logic [31:0] md_lol;          // quotient / product low, for OP_MDRES
 logic        md_ovfl;         // the last divide overflowed
 logic        md_go;           // this EX uop has started the unit
+logic        md_fin;          // ... and the unit has finished (done is a pulse: EX may
+                              // be stalled by WB in that cycle)
 logic        md_z;            // ... is a divide by zero (from its second cycle)
-logic        md_fin;          // ... and the unit has finished (done is a one-cycle
-                              // pulse: EX may be held by WB in that cycle)
 wire         ex_is_md   = (ex_u.op == OP_MUL) || (ex_u.op == OP_DIV);
 wire         ex_div0    = (ex_u.op == OP_DIV) &&
                           ((ex_u.sz == SZ_W) ? (ex_av[15:0] == 16'd0) : (ex_av == 32'd0));
@@ -571,7 +629,7 @@ wire [31:0] md_blo  = (ex_u.op == OP_MUL && ex_u.sz == SZ_W) ?
 wire [31:0] md_bhi  = (ex_u.op == OP_DIV) ?
                       ((ex_u.cond[1]) ? md_hiin : (md_sign ? {32{ex_bv[31]}} : 32'd0)) : 32'd0;
 
-ap68040_muldiv md (
+ap68040_muldiv #(.DSTEPS(DIV_STEPS)) md (
 	.clk(clk), .nreset(nreset), .kill(kill_now),
 	.start(ex_md_start), .is_div(ex_u.op == OP_DIV), .sign_op(md_sign),
 	.op_a(md_a), .op_hi(md_bhi), .op_lo(md_blo),
@@ -700,13 +758,20 @@ logic  [7:0] bf_lo_out;
 // (ins_top) is registered first (bf_ins_q, in ex_pb's cycle), so the field
 // merge starts from flip-flops -- three variable shifts in a row do not
 // close at 60 MHz without register retiming
+// Every bit field operation takes that cycle: the rotated operand is
+// registered (bf_rot_q), and the extraction, flags and merge start from it
+// (a rotate and a second variable shift in one cycle do not close at 65 MHz)
 logic        ex_pb;
-logic [31:0] bf_ins_q;
+logic [31:0] bf_ins_q, bf_rot, bf_rot_q;
+logic [31:0] bf_rr;             // the shared right rotator's output (below)
+logic  [5:0] rox_nx, rox_nx_q;  // ROXL/ROXR: their count mod (size + 1), the same way
+logic  [6:0] rox_nxl, rox_nxl_q; // ROXL: its funnel amount, the same way (from the registered count)
+wire         ex_pre = (ex_u.op == OP_BF) || (ex_u.op == OP_ROXL) || (ex_u.op == OP_ROXR);
 wire         ex_bfins = (ex_u.op == OP_BF) && (ex_u.cond[2:0] == 3'd7);
 logic  [4:0] bf_flags;
 always_comb begin
 	logic [4:0]  o;
-	logic [31:0] top, rot, fld, ins_top, nrot, nreg, zf;
+	logic [31:0] top, rot, fld, ins_top, nrot, nrot_v, nreg, zf;
 	logic [39:0] win, mask40, ins40, nwin;
 	logic [5:0]  lz;
 	logic        nflag, zflag;
@@ -735,14 +800,31 @@ always_comb begin
 		mask40 = {top, 8'h00} >> o;
 		ins40  = {ins_top, 8'h00} >> o;
 	end
-	fld = rot >> bf_wn;
+	bf_rot = rot;
+	rot    = bf_rot_q;
 	case (t)
-		3'd2: nrot = rot ^ top;                     // BFCHG
-		3'd4: nrot = rot & ~top;                    // BFCLR
-		3'd6: nrot = rot | top;                     // BFSET
-		default: nrot = (rot & ~top) | (ins_top & top);   // BFINS
+		3'd2: nrot_v = rot ^ top;                     // BFCHG
+		3'd4: nrot_v = rot & ~top;                    // BFCLR
+		3'd6: nrot_v = rot | top;                     // BFSET
+		default: nrot_v = (rot & ~top) | (ins_top & top);   // BFINS
 	endcase
-	nreg = 32'({nrot, nrot} >> o);
+	// One right rotator for three shifts that never run in the same cycle:
+	// the pre-cycle's BFINS source (ex_av << (32 - w): rotated right by w,
+	// masked to the field's top bits), and in the main cycle the extracted
+	// field (rot >> (32 - w): rotated right by 32 - w, masked to the low w
+	// bits) or the register's merged value rotated back (nreg, by the offset)
+	begin
+		logic [31:0] ri;
+		logic  [4:0] ra;
+		logic        ext;
+		ext = (t == 3'd1) || (t == 3'd3);
+		ri  = !ex_pb ? ex_av : ext ? rot : nrot_v;
+		ra  = !ex_pb ? bf_w[4:0] : ext ? bf_wn[4:0] : o;
+		bf_rr = 32'({ri, ri} >> ra);
+	end
+	fld = bf_rr & ~bf_sx;
+	nrot = nrot_v;
+	nreg = bf_rr;
 	case (t)
 		3'd2: nwin = win ^ mask40;
 		3'd4: nwin = win & ~mask40;
@@ -776,8 +858,6 @@ always_comb begin
 	endcase
 end
 
-// CHK2/CMP2 lower-bound result kept between the two uops
-logic        chk2_lo_lt, chk2_lo_eq;
 
 //--------------------------------------------------------------------------
 // EX result selection
@@ -785,6 +865,15 @@ logic        chk2_lo_lt, chk2_lo_eq;
 logic [31:0] ex_res;
 logic  [4:0] ex_flags;
 logic        ex_dkill;        // suppress the register write
+logic  [5:0] ex_kc;           // EX's uop is FPU, DIV, MDRES, DBcc, CHK2B, CAS2R (the ones that can)
+logic        ex_dkill_chk;    // (simulation: the case form)
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && ex_v && ex_u.d_v && (!ex_slow || ex_ph) && ex_dkill != ex_dkill_chk) begin
+		$display("FAIL: ex_dkill %b, the case form %b (op %0d, pc %h)", ex_dkill, ex_dkill_chk, ex_u.op, ex_u.pc);
+		$finish;
+	end
+// synthesis translate_on
 logic        ex_taken;        // control transfer taken
 logic [31:0] ex_target;
 logic  [7:0] ex_xvec;         // exception raised in EX
@@ -792,7 +881,9 @@ logic [31:0] ex_st;           // store data
 logic        ex_sr_we;
 logic [15:0] ex_sr_new;
 
-// special register read
+// special register read: the MOVEC numbers as {ext[11], ext[3:0]}
+// ($000-$007 -> $00-$07, $800-$807 -> $10-$17; USP, MSP and ISP live in
+// the register file), then SR and CCR
 function automatic logic [31:0] spr_read(input logic [7:0] n);
 	case (n)
 		8'h00: spr_read = {29'd0, sfc_r};
@@ -803,18 +894,12 @@ function automatic logic [31:0] spr_read(input logic [7:0] n);
 		8'h05: spr_read = itt1_r;
 		8'h06: spr_read = dtt0_r;
 		8'h07: spr_read = dtt1_r;
-		8'h09: spr_read = vbr_r;
-		8'h0D: spr_read = mmusr_r;
-		8'h0E: spr_read = urp_r;
-		8'h0F: spr_read = srp_r;
-		8'h10: spr_read = {16'd0, sr_r[15:5], ccr_f};     // SR
-		8'h11: spr_read = {27'd0, ccr_f};                   // CCR
-		8'h20: spr_read = xi_pc;
-		8'h21: spr_read = {16'd0, xi_sr};
-		8'h22: spr_read = {16'd0, xi_vecw};
-		8'h23: spr_read = xi_addr;
-		8'h24: spr_read = {16'd0, xi_ssw};
-		8'h25: spr_read = vbr_r + {22'd0, xi_vecw[9:0]};  // vector address
+		8'h11: spr_read = vbr_r;
+		8'h15: spr_read = mmusr_r;
+		8'h16: spr_read = urp_r;
+		8'h17: spr_read = srp_r;
+		8'h20: spr_read = {16'd0, sr_r[15:5], ccr_f};     // SR
+		8'h21: spr_read = {27'd0, ccr_f};                   // CCR
 		default: spr_read = 32'd0;
 	endcase
 endfunction
@@ -842,15 +927,44 @@ typedef struct packed {
 } exo_t;
 
 wire  ex_slow = is_slow(ex_u.op);
+// shifts and rotates: N and Z are the result's sign and zero test at the
+// size, taken in the second cycle from the registered result (the barrel
+// shift and a 32-bit zero test do not fit one cycle with the count logic)
+wire  ex_shift = (ex_u.op == OP_ASL) || (ex_u.op == OP_ASR) || (ex_u.op == OP_LSL) ||
+                 (ex_u.op == OP_LSR) || (ex_u.op == OP_ROL) || (ex_u.op == OP_ROR) ||
+                 (ex_u.op == OP_ROXL) || (ex_u.op == OP_ROXR);
 logic ex_ph;                    // second cycle of a slow op
+// the shift's kind for the slow unit, one-hot, registered with ex_u
+function automatic logic [7:0] shk_of(input logic [6:0] o);
+	shk_of = {o == OP_ROXR, o == OP_ROXL, o == OP_ROR, o == OP_ROL,
+	          o == OP_LSR, o == OP_ASR, o == OP_LSL, o == OP_ASL};
+endfunction
+logic [7:0] ex_shk;
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && ex_v && ex_shk != shk_of(ex_u.op)) begin
+		$display("FAIL: the registered shift kind %b, the op's %b", ex_shk, shk_of(ex_u.op));
+		$finish;
+	end
+// synthesis translate_on
 exo_t xf, xs, xs_q;
 
 logic [31:0] sl_res;
 logic  [4:0] sl_flags;
+logic        sl_sim_c;
 ap68040_alu_slow alu_s (
-	.op(ex_u.op), .sz(ex_u.sz), .a(ex_av), .b(ex_bv), .cnt(ex_a[5:0]), .flags_in(ccr_f),
-	.res(sl_res), .flags_out(sl_flags)
+	.op(ex_u.op), .shk(ex_shk), .sz(ex_u.sz), .a(ex_av), .b(ex_bv), .cnt(ex_a[5:0]), .flags_in(ccr_f),
+	.nx_q(rox_nx_q), .nx(rox_nx), .nxl_q(rox_nxl_q), .nxl(rox_nxl),
+	.res(sl_res), .flags_out(sl_flags), .sim_c(sl_sim_c)
 );
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && ex_v && ex_shift && (!ex_pre || ex_pb) && sl_flags[0] !== sl_sim_c) begin
+		$display("FAIL: the shift's direct carry %b, the funnel's %b (op %0d, sz %0d, count %0d, b %h, pc %h)",
+		         sl_flags[0], sl_sim_c, ex_u.op, ex_u.sz, ex_a[5:0], ex_bv, ex_u.pc);
+		$finish;
+	end
+// synthesis translate_on
 // synthesis translate_off
 always_ff @(posedge clk)
 	if (nreset && ex_v && wb_v && ew_same != (ex_u.pc == wb_u.pc)) begin
@@ -904,7 +1018,9 @@ always_comb begin
 		OP_MDHI:   xf.res = ex_av;
 		OP_BCC:    xf.taken = alu_cc;
 		OP_DBCC: begin
-			xf.taken = !alu_cc && (alu_res[15:0] != 16'hFFFF);
+			// (the counter before the decrement: Dn.W - 1 == -1 exactly when
+			// Dn.W is 0 -- the adder stays off the branch decision)
+			xf.taken = !alu_cc && (ex_bv[15:0] != 16'd0);
 			xf.dkill = alu_cc;
 		end
 		OP_TRAPCC: if (alu_trap) xf.xvec = 8'd7;
@@ -940,7 +1056,7 @@ end
 // slow operations (first EX cycle)
 always_comb begin
 	xs.res    = sl_res;
-	xs.flags  = sl_flags;
+	xs.flags  = ex_shift ? {sl_flags[4], 2'b00, sl_flags[1:0]} : sl_flags;
 	xs.dkill  = 1'b0;
 	xs.taken  = 1'b0;
 	xs.target = ex_u.target;
@@ -977,7 +1093,7 @@ always_comb begin
 				2'd2:    n = cur ^ ex_av[15:0];
 				default: n = ex_av[15:0];
 			endcase
-			xs.sr_new = n & 16'hF71F;
+			xs.sr_new = n & SR_MASK;
 			xs.sr_we  = 1'b1;
 			xs.flags  = xs.sr_new[4:0];
 		end
@@ -993,10 +1109,13 @@ always_comb begin
 			xs.res   = ex_av;              // maintenance: the address
 			if (ex_u.cond == 4'd2) begin
 				// STOP #imm: SR = imm, then wait for an interrupt
-				xs.sr_new = ex_av[15:0] & 16'hF71F;
+				xs.sr_new = ex_av[15:0] & SR_MASK;
 				xs.sr_we  = 1'b1;
 				xs.flags  = xs.sr_new[4:0];
 			end
+			// BKPT: after its acknowledge cycle, the illegal instruction
+			// exception (format $0, the BKPT's PC)
+			if (ex_u.cond == 4'd9) xs.xvec = 8'd4;
 		end
 		OP_IACKV: begin
 			// IACK data: [7:0] vector, [8] AVEC, [9] TEA (spurious)
@@ -1032,7 +1151,7 @@ always_comb begin
 			endcase
 		end
 		OP_RTE: begin
-			xs.sr_new = ex_av[15:0] & 16'hF71F;
+			xs.sr_new = ex_av[15:0] & SR_MASK;
 			xs.sr_we  = 1'b1;
 			xs.flags  = xs.sr_new[4:0];
 			xs.taken  = 1'b1;
@@ -1050,9 +1169,23 @@ end
 always_comb begin
 	exo_t x;
 	x = ex_slow ? xs_q : xf;
+	if (ex_slow && ex_shift) begin
+		x.flags[3] = (ex_u.sz == SZ_B) ? xs_q.res[7] : (ex_u.sz == SZ_W) ? xs_q.res[15] : xs_q.res[31];
+		x.flags[2] = (ex_u.sz == SZ_B) ? (xs_q.res[7:0] == 8'd0) :
+		             (ex_u.sz == SZ_W) ? (xs_q.res[15:0] == 16'd0) : (xs_q.res == 32'd0);
+	end
 	ex_res    = x.res;
 	ex_flags  = x.flags;
-	ex_dkill  = x.dkill;
+	// (the uops that can suppress their write, by flags registered as they
+	// enter EX, so the kill is an AND-OR of its sources: no op decode on
+	// the way to the forwarding enable; the others never kill, slow ones
+	// included)
+	ex_dkill  = (ex_kc[0] && fp_dkill) || (ex_kc[1] && md_dkill) ||
+	            (ex_kc[2] && md_ovfl) || (ex_kc[3] && alu_cc) ||
+	            ex_kc[4] || (ex_kc[5] && cas2_eq);
+	// synthesis translate_off
+	ex_dkill_chk = x.dkill;
+	// synthesis translate_on
 	ex_taken  = x.taken;
 	ex_target = x.target;
 	ex_xvec   = x.xvec;
@@ -1108,12 +1241,12 @@ end
 // to keep coherent: the 68040 prefetches both paths of a branch and
 // requires CPUSHA before self-modified code runs (MC68040UM 4.5, 7.7).
 wire ex_smc = (ex_u.mem == M_ST || ex_u.mem == M_RMW) &&
-              ((ex_ea[31:6] == ex_u.npc[31:6]) ||
-               (ex_ea[31:6] == ex_u.npc[31:6] + 26'd1));
+              ((ex_ea[31:6] == ex_npc[31:6]) ||
+               (ex_ea[31:6] == ex_npc[31:6] + 26'd1));
 logic smc_pend;
 // mispredict: the actual path differs from the one the front end took
 wire        ex_br      = (ex_u.br != BR_NONE) || (ex_u.op == OP_RTE);
-wire [31:0] ex_next    = ex_taken ? ex_target : ex_u.npc;
+wire [31:0] ex_next    = ex_taken ? ex_target : ex_npc;
 wire        ex_mispred = ex_br && ((ex_taken != ex_u.pred) ||
                                    (ex_taken && ex_u.pred && ex_target != ex_u.target));
 // a mispredicted branch that WB will redirect for no other reason turns
@@ -1175,6 +1308,10 @@ assign exw_v   = adv_ex && ex_d_eff && !ex_fault && (ex_xvec == 8'd0) && !ex_odd
 // the same for AG's base/index loads: without EX's exception decision (a
 // late signal) -- a uop that takes an exception flushes AG with the rest
 wire        exw_ag  = adv_ex && ex_d_eff;
+// ... and for the operands of the uops in DC1 and DC2: a uop that takes an
+// exception flushes them too, and the flush clears the front file (fv), so
+// the forwarding needs only whether EX writes the register (the timing path)
+wire        exw_fw  = exw_ag;
 assign exw_reg = ex_u.d_reg;
 assign exw_val = (ex_u.op == OP_CAS) ? ((ex_bv & ex_szm) | (ex_latch & ~ex_szm)) : ex_res;
 // synthesis translate_off
@@ -1201,10 +1338,12 @@ logic  [2:0] irq_lvl_r;       // level being acknowledged
 // the request is held at that level or above.
 logic        ipend_r;
 logic  [2:0] ipend_lvl;
-wire  [2:0]  irq_mask = (wb_v && wb_sr_we && wb_exc == 8'd0) ? wb_sr_new[10:8] : sr_r[10:8];
-wire         irq_pend = nmi_edge ||
-                        (ipl_q != 3'd7 && (ipl_q > irq_mask ||
-                                           (ipend_r && ipl_q >= ipend_lvl)));
+wire  [2:0]  irq_mask = (wb_v && wb_sr_we && wb_ok) ? wb_sr_new[10:8] : sr_r[10:8];
+// level 7 is also recognised by level comparison whenever the mask is
+// below 7 (MC68040UM 8.2.9, figure 8-3: RTE or MOVE to SR lowering the
+// mask with IPL still at 7 takes it again); at mask 7 only its edge
+wire         irq_pend = nmi_edge || (ipl_q > irq_mask) ||
+                        (ipl_q != 3'd7 && ipend_r && ipl_q >= ipend_lvl);
 wire  [2:0]  irq_lvl  = nmi_edge ? 3'd7 : ipl_q;
 
 logic        stopped;         // STOP: waiting for an interrupt
@@ -1212,9 +1351,15 @@ logic [31:0] stop_pc;         // the instruction after STOP
 logic        trace_defer;     // a trace held back by an interrupt
 logic [31:0] trace_addr;      // its instruction address
 logic        rst_issued;      // RESET instruction: RSTO requested
+logic        wb_stv;          // WB: a store, and no exception
+logic        xstk;            // an exception routine runs (entry to its last uop)
+logic        xr_dbl;          // ... and it is an access error's, an address
+                              // error's or reset's (a fault in it: halt)
+logic        x_first;         // the routine is done, its handler's first
+                              // instruction has not completed yet
 logic        wb_cof;          // the uop's control transfer was taken
 
-wire wb_is_exc   = wb_v && (wb_exc != 8'd0);
+wire wb_is_exc   = wb_v && !wb_ok;
 wire wb_commit   = adv_wb && !wb_is_exc;
 wire wb_bound    = wb_commit && wb_u.last;
 wire [31:0] wb_next = wb_redir_pc;
@@ -1228,55 +1373,90 @@ wire wb_is_stop  = (wb_u.op == OP_MISC) && (wb_u.cond == 4'd2);
 wire stop_traced = wb_is_stop && (sr_r[15] || (sr_r[14] && (wb_sr_new[15:8] != sr_r[15:8])));
 // an interrupt accepted at a boundary where a trace is also due goes first;
 // the trace is held (trace_defer) and taken at the end of the interrupt's
-// exception processing, stacking the handler's entry address
+// exception processing, stacking the handler's entry address (MC68040UM
+// 8.3: the interrupt's processing follows the other exception's at once)
 wire trace_due   = wb_bound && (wb_is_stop ? stop_traced : (tr_now || trace_defer));
 // a MOVEM continuation armed by RTE runs before a pending interrupt
 wire cm_block    = cm_pend || (wb_v && wb_u.op == OP_RTE && cm_n_v);
 wire take_irq    = irq_pend && !cm_block && (wb_bound || (stopped && !wb_v));
 wire take_trace  = trace_due && !take_irq;
+wire wb_refetch;
 // a speculative fetch fault (code 1) is no exception: WB refetches the
 // instruction once on demand, and only a second fault there is an access
 // error (rt_armed/rt_pc)
 // exceptions that stack the next instruction: the instruction completed
 wire wb_post_trap = (wb_exc >= 8'd32 && wb_exc < 8'd48) ||
                     wb_exc == 8'd5 || wb_exc == 8'd6 || wb_exc == 8'd7;
-wire wb_refetch  = adv_wb && wb_v && (wb_exc == EXC_IFS || wb_exc == EXC_IFSA);
+assign wb_refetch = adv_wb && wb_v && (wb_exc == EXC_IFS || wb_exc == EXC_IFSA);
 logic        rt_armed;
 logic [31:0] rt_pc;
-wire x_go        = (adv_wb && wb_is_exc && !wb_refetch) || take_trace || take_irq;
+// a double bus fault (MC68040UM 8.2.1): an access or address error while
+// the routine of an access error, an address error or reset runs (the
+// stacking, the vector fetch, an odd handler address), or while the first
+// instruction of its handler is fetched (an instruction access error: TM
+// is a program space): the processor halts (PST $5) instead of taking it
+wire dbl_fault   = xr_dbl && !halted &&
+                   (adv_wb && wb_is_exc && !wb_refetch &&
+                    ((xstk && (wb_exc == 8'd2 || wb_exc == 8'd3)) ||
+                     (x_first && wb_exc == 8'd2 && (wb_exc_ssw[2:0] == 3'd2 || wb_exc_ssw[2:0] == 3'd6))));
+wire x_go        = ((adv_wb && wb_is_exc && !wb_refetch) || take_trace || take_irq) &&
+                   !dbl_fault && !halted;
+// a locked sequence (TAS, CAS, CAS2, a table update) ends with its LOCKE
+// write; before that only an exception ends it
+assign lk_abandon = x_go || dbl_fault;
 
 // register file write ports.  Front: the AG address updates and the EX
 // result.  Back: the WB commit (a result beats an address update), the
 // address update of a trap after its instruction, and at exception entry
-// the routine's operands (T5-T13, three per cycle).
+// the routine's operands (T8-T13, and T5-T7 for a format $7 frame, two
+// per cycle).
 always_comb begin
 	logic wcom, wpost;
 	fwe[0] = adv_ag && ag_u.upd_v && !ag_dyncan;  fwa[0] = ag_u.upd_reg;  fwd[0] = ag_updv;
 	fwe[1] = adv_ag && ag_u.upd2_v && !ag_dyncan; fwa[1] = ag_u.upd2_reg; fwd[1] = ag_u2v;
+	fwe_ag[0] = ag_v && ag_u.upd_v && !ag_dyncan;
+	fwe_ag[1] = ag_v && ag_u.upd2_v && !ag_dyncan;
 	fwe[2] = exw_v;                 fwa[2] = exw_reg;       fwd[2] = exw_val;
 	wcom  = wb_commit;
 	wpost = adv_wb && wb_is_exc && (wb_post_trap || wb_xcommit);
-	bwe[0] = (wcom || wpost) && wb_u.upd2_v; bwa[0] = wb_u.upd2_reg; bwd[0] = wb_upd2_val;
-	bwe[1] = (wcom || wpost) && wb_u.upd_v;  bwa[1] = wb_u.upd_reg;  bwd[1] = wb_upd_val;
-	bwe[2] = wcom && wb_dwe;                 bwa[2] = wb_u.d_reg;    bwd[2] = wb_res;
+	// the back file: two write ports, the later winning on the same
+	// register.  Port 0 the address update; port 1 the result, else the
+	// second (deferred) update -- a uop with upd2 writes no register result
+	// (its destination is memory), and its upd2 yields to its upd on the
+	// same register.  So a result beats an update, and upd beats upd2.
+	bwe[0] = (wcom || wpost) && wb_u.upd_v;  bwa[0] = wb_u.upd_reg;  bwd[0] = wb_upd_val;
+	if (wcom && wb_dwe) begin
+		bwe[1] = 1'b1; bwa[1] = wb_u.d_reg; bwd[1] = wb_res;
+	end
+	else begin
+		bwe[1] = (wcom || wpost) && wb_u.upd2_v && !(wb_u.upd_v && wb_u.upd_reg == wb_u.upd2_reg);
+		bwa[1] = wb_u.upd2_reg; bwd[1] = wb_upd2_val;
+	end
+	bwe[2] = 1'b0; bwa[2] = '0; bwd[2] = '0;
 	case (xw_ph)
-		2'd1: begin
-			bwe = 3'b111;
+		3'd1: begin
+			bwe = 3'b011;
 			bwa[0] = R_T0 + 5'd8;  bwd[0] = xi_vaddr;
 			bwa[1] = R_T0 + 5'd9;  bwd[1] = xi_pc;
-			bwa[2] = R_T0 + 5'd10; bwd[2] = {16'd0, xi_sr};
 		end
-		2'd2: begin
-			bwe = 3'b111;
-			bwa[0] = R_T0 + 5'd11; bwd[0] = xi_addr;
-			bwa[1] = R_T0 + 5'd12; bwd[1] = {16'd0, xi_vecw};
-			bwa[2] = R_T0 + 5'd13; bwd[2] = {16'd0, xi_ssw};
+		3'd2: begin
+			bwe = 3'b011;
+			bwa[0] = R_T0 + 5'd10; bwd[0] = {16'd0, xi_sr};
+			bwa[1] = R_T0 + 5'd11; bwd[1] = xi_addr;
 		end
-		2'd3: begin
-			bwe = 3'b111;
+		3'd3: begin
+			bwe = 3'b011;
+			bwa[0] = R_T0 + 5'd12; bwd[0] = {16'd0, xi_vecw};
+			bwa[1] = R_T0 + 5'd13; bwd[1] = {16'd0, xi_ssw};
+		end
+		3'd4: begin
+			bwe = 3'b011;
 			bwa[0] = R_T0 + 5'd5;  bwd[0] = xi_ea;
 			bwa[1] = R_T0 + 5'd6;  bwd[1] = xi_w3a;
-			bwa[2] = R_T0 + 5'd7;  bwd[2] = xi_w3d;
+		end
+		3'd5: begin
+			bwe = 3'b001;
+			bwa[0] = R_T0 + 5'd7;  bwd[0] = xi_w3d;
 		end
 		default: ;
 	endcase
@@ -1287,10 +1467,10 @@ end
 wire wb_reset    = (wb_u.op == OP_MISC) && (wb_u.cond == 4'd1);
 wire wb_mt       = (wb_u.op == OP_MISC) && (wb_u.cond >= 4'd3) && (wb_u.cond <= 4'd5);
 logic mt_seen;                // the DMU finished this WB uop's maintenance
-assign wb_hold = wb_v && !wb_is_exc &&
+assign wb_hold = wb_v && (halted || (!wb_is_exc &&
                  ((wb_st && !dm_st_rdy) || (wb_st && dm_st_fault) ||
                   (wb_reset && (!rst_issued || rsto_busy)) ||
-                  (wb_mt && !mt_seen));
+                  (wb_mt && !mt_seen))));
 
 assign mt_v      = wb_v && wb_mt && !wb_is_exc && !mt_seen;
 assign mt_op     = (wb_u.cond == 4'd3) ? (wb_u.imm_b[5] ? 3'd2 : 3'd1) :
@@ -1301,7 +1481,7 @@ assign mt_caches = wb_u.imm_b[7:6];
 assign mt_addr   = wb_res;
 assign mt_fc     = dfc_r;
 assign mt_ng     = (wb_u.cond == 4'd4) && !wb_u.imm_b[3];
-assign mt_wr     = (wb_u.cond == 4'd5) && !wb_u.imm_b[5];
+assign mt_wr     = (wb_u.cond == 4'd5) && !wb_u.imm_b[5];   // PTESTW $F548, PTESTR $F568
 
 logic        rst_seq;         // reset exception pending (first cycles)
 
@@ -1321,10 +1501,10 @@ logic [31:0] x_cm_ea;
 always_comb begin
 	logic [15:0] cur;
 	// the SR the exception sees: after this instruction when it completed
-	cur = wb_commit ? (wb_sr_we ? (wb_sr_new & 16'hF71F) : {sr_r[15:5], wb_ccr})
+	cur = wb_commit ? (wb_sr_we ? (wb_sr_new & SR_MASK) : {sr_r[15:5], wb_ccr})
 	                : {sr_r[15:5], wb_ccr};
 	if (stopped && !wb_v) cur = {sr_r[15:5], ccr_b};
-	if (adv_wb && wb_is_exc && wb_oddrte) cur = wb_sr_new & 16'hF71F;
+	if (adv_wb && wb_is_exc && wb_oddrte) cur = wb_sr_new & SR_MASK;
 	x_osr  = cur;
 	x_ssw  = 16'd0;
 	x_addr = wb_u.pc;
@@ -1338,7 +1518,7 @@ always_comb begin
 		// TRAP #n, TRAPcc, CHK and divide-by-zero stack the next
 		// instruction; faults and illegal opcodes the instruction
 		x_pc   = ((wb_exc >= 8'd32 && wb_exc < 8'd48) ||
-		          wb_exc == 8'd5 || wb_exc == 8'd6 || wb_exc == 8'd7) ? wb_u.npc : wb_u.pc;
+		          wb_exc == 8'd5 || wb_exc == 8'd6 || wb_exc == 8'd7) ? wb_npc : wb_u.pc;
 		if (wb_exc_pcv) x_pc = wb_exc_pc;
 	end
 	else if (take_irq) begin
@@ -1352,6 +1532,9 @@ always_comb begin
 		x_pc   = wb_next;
 		x_addr = trace_defer ? trace_addr : wb_u.pc;
 	end
+	// 68040 frames (MC68040UM table 8-?): $7 access error; $2 address
+	// error, CHK, TRAPcc/TRAPV, divide by zero, trace; $0 the rest; the FPU
+	// brings its own ($0, $2, $3)
 	x_fmt  = (x_vec == 8'd2) ? 4'h7 :
 	         (x_vec == 8'd3 || x_vec == 8'd5 || x_vec == 8'd6 || x_vec == 8'd7 ||
 	          x_vec == 8'd9) ? 4'h2 : 4'h0;
@@ -1389,6 +1572,14 @@ function automatic logic [6:0] ras_after(input ras_snap_t r);
 endfunction
 
 always_ff @(posedge clk) begin
+	// (AG's uop PC and the continued MOVEM's PC as they will be: their
+	// compare is registered, cm_hit_q)
+	// (each candidate pair compared in parallel; AG's late take and WB's
+	// write of cm_pc select last)
+	logic ag_ld, cm_wr, cm_rst;
+	ag_ld  = 1'b0;
+	cm_wr  = 1'b0;
+	cm_rst = 1'b0;
 	redir_v <= 1'b0;
 	ras_rv  <= 1'b0;
 	exc_go  <= 1'b0;
@@ -1399,10 +1590,12 @@ always_ff @(posedge clk) begin
 
 	if (!nreset) begin
 		ag_v  <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
+		sk_v  <= 1'b0;
+		sk_vr <= 1'b0;
 		eredir_pend <= 1'b0;
 		wb_eredir   <= 1'b0;
 		fv <= 32'd0;
-		xw_ph <= 2'd0;
+		xw_ph <= 3'd0;
 		ccr_f   <= 5'd0;
 		ccr_b   <= 5'd0;
 		sr_r    <= 16'h2700;
@@ -1414,13 +1607,26 @@ always_ff @(posedge clk) begin
 		itt0_r  <= 32'd0; itt1_r <= 32'd0; dtt0_r <= 32'd0; dtt1_r <= 32'd0;
 		mmusr_r <= 32'd0; urp_r  <= 32'd0; srp_r  <= 32'd0;
 		xi_pc   <= 32'd0; xi_addr <= 32'd0; xi_sr <= 16'd0; xi_vecw <= 16'd0; xi_ssw <= 16'd0;
+		xi_ea   <= 32'd0; xi_w3a <= 32'd0; xi_w3d <= 32'd0; xi_f7 <= 1'b0;
 		md_go   <= 1'b0;
-		md_z    <= 1'b0;
+		md_hiin <= 32'd0;
+		cas2_eq <= 1'b0;
+		rte_fmt1 <= 1'b0;
+		rte_fmt7 <= 1'b0;
+		cm_n_v   <= 1'b0;
+		cm_n_ea  <= 32'd0;
+		cm_pend  <= 1'b0;
+		cm_ea    <= 32'd0;
+		cm_pc    <= 32'd0;
+		cm_rst   = 1'b1;
+		wb_mv_ea <= 32'd0;
+		trace_defer <= 1'b0;
+		trace_addr <= 32'd0;
 		md_fin  <= 1'b0;
+		md_z    <= 1'b0;
 		ex_ph   <= 1'b0;
 		ex_pb   <= 1'b0;
 		xs_q    <= '0;
-		md_hiin <= 32'd0;
 		md_rem  <= 32'd0;
 		md_lol  <= 32'd0;
 		md_ovfl <= 1'b0;
@@ -1431,9 +1637,6 @@ always_ff @(posedge clk) begin
 		bf_top   <= 32'hFFFF_FFFF;
 		bf_sx    <= 32'd0;
 		bf_lonew <= 8'd0;
-		chk2_lo_lt <= 1'b0; chk2_lo_eq <= 1'b0;
-		cas2_eq <= 1'b0;
-		rte_fmt1 <= 1'b0;
 		ipl_q   <= 3'd0;
 		nmi_edge <= 1'b0;
 		irq_lvl_r <= 3'd0;
@@ -1442,16 +1645,8 @@ always_ff @(posedge clk) begin
 		rt_armed <= 1'b0;
 		rt_pc    <= 32'd0;
 		smc_pend <= 1'b0;
-		rte_fmt7 <= 1'b0;
-		cm_n_v   <= 1'b0;
-		cm_n_ea  <= 32'd0;
-		cm_pend  <= 1'b0;
-		cm_ea    <= 32'd0;
-		cm_pc    <= 32'd0;
 		stopped <= 1'b0;
 		stop_pc <= 32'd0;
-		trace_defer <= 1'b0;
-		trace_addr <= 32'd0;
 		rst_issued <= 1'b0;
 		mt_seen <= 1'b0;
 		wb_cof  <= 1'b0;
@@ -1515,11 +1710,11 @@ always_ff @(posedge clk) begin
 		end
 		if (!stall_dc1) dc1_v <= adv_ag;
 		else begin
-			if (exw_v && dc1_u.a_src == OS_REG && dc1_u.a_reg == exw_reg) dc1_a <= exw_val;
-			if (exw_v && dc1_u.b_src == OS_REG && dc1_u.b_reg == exw_reg) dc1_b <= exw_val;
+			if (exw_fw && dc1_u.a_src == OS_REG && dc1_u.a_reg == exw_reg) dc1_a <= exw_val;
+			if (exw_fw && dc1_u.b_src == OS_REG && dc1_u.b_reg == exw_reg) dc1_b <= exw_val;
 		end
 		// snoop into the uop entering DC1
-		if (adv_ag && exw_v) begin
+		if (adv_ag && exw_fw) begin
 			if (ag_u.a_src == OS_REG && ag_u.a_reg == exw_reg) dc1_a <= exw_val;
 			if (ag_u.b_src == OS_REG && ag_u.b_reg == exw_reg) dc1_b <= exw_val;
 		end
@@ -1531,13 +1726,13 @@ always_ff @(posedge clk) begin
 			dc2_u    <= dc1_u;
 			dc2_ee   <= dc1_ee;
 			dc2_er   <= dc1_er;
-			dc2_a    <= (exw_v && dc1_u.a_src == OS_REG && dc1_u.a_reg == exw_reg) ? exw_val : dc1_a;
-			dc2_b    <= (exw_v && dc1_u.b_src == OS_REG && dc1_u.b_reg == exw_reg) ? exw_val : dc1_b;
+			dc2_a    <= (exw_fw && dc1_u.a_src == OS_REG && dc1_u.a_reg == exw_reg) ? exw_val : dc1_a;
+			dc2_b    <= (exw_fw && dc1_u.b_src == OS_REG && dc1_u.b_reg == exw_reg) ? exw_val : dc1_b;
 			dc2_ea   <= dc1_ea;
 			dc2_upd  <= dc1_upd;
 			dc2_upd2 <= dc1_upd2;
 		end
-		else if (dc2_v && exw_v) begin
+		else if (dc2_v && exw_fw) begin
 			if (dc2_u.a_src == OS_REG && dc2_u.a_reg == exw_reg) dc2_a <= exw_val;
 			if (dc2_u.b_src == OS_REG && dc2_u.b_reg == exw_reg) dc2_b <= exw_val;
 		end
@@ -1548,6 +1743,11 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		if (adv_dc2) begin
 			ex_u     <= dc2_u;
+			ex_npc   <= dc2_u.pc + {27'd0, dc2_u.ilen, 1'b0};
+			ex_kc    <= {dc2_u.op == OP_CAS2R, dc2_u.op == OP_CHK2B,
+			             dc2_u.op == OP_DBCC, dc2_u.op == OP_MDRES, dc2_u.op == OP_DIV,
+			             dc2_u.op == OP_FPU};
+			ex_shk   <= shk_of(dc2_u.op);
 			ex_ee    <= dc2_ee;
 			ex_er    <= dc2_er;
 			ex_a     <= (exw_v && dc2_u.a_src == OS_REG && dc2_u.a_reg == exw_reg) ? exw_val : dc2_a;
@@ -1561,19 +1761,21 @@ always_ff @(posedge clk) begin
 			ex_faddr <= dm_faddr;
 			ex_fssw  <= dm_fssw;
 			md_go    <= 1'b0;
-			md_z     <= 1'b0;
 			md_fin   <= 1'b0;
+			md_z     <= 1'b0;
 		end
 		if (!stall_ex) ex_v <= adv_dc2;
 		// EX's next uop against WB's next: EX's own when it moves on
 		if (adv_dc2) ew_same <= adv_ex ? (dc2_u.pc == ex_u.pc) : (dc2_u.pc == wb_u.pc);
 		else if (adv_ex) ew_same <= 1'b1;
 		if (ex_md_start) md_go <= 1'b1;
-		if (md_done && !adv_ex) md_fin <= 1'b1;   // held: kept until EX moves on
 		if (ex_v && ex_div0) md_z <= 1'b1;
-		if (ex_v && ex_bfins && !ex_pb) begin
+		if (ex_v && ex_pre && !ex_pb) begin
 			ex_pb    <= 1'b1;
-			bf_ins_q <= ex_av << bf_wn;
+			bf_ins_q <= bf_rr & bf_top;    // (ex_av << bf_wn)
+			bf_rot_q <= bf_rot;
+			rox_nx_q <= rox_nx;
+			rox_nxl_q <= rox_nxl;
 		end
 		else if (ex_v && ex_slow && !ex_ph) begin
 			ex_ph <= 1'b1;
@@ -1586,13 +1788,17 @@ always_ff @(posedge clk) begin
 		//------------------------------------------------------------------
 		if (adv_ex) begin
 			wb_u        <= ex_u;
+			wb_npc      <= ex_npc;
 			wb_res      <= exw_val;
 			wb_dwe      <= ex_d_eff;
 			wb_upd_val  <= ex_upd;
 			wb_upd2_val <= ex_upd2;
 			wb_st       <= (ex_u.mem == M_ST || ex_u.mem == M_RMW) && !ex_stkill;
-			if (ex_u.op == OP_CAS2C)
-				cas2_eq <= ex_u.cond[0] ? (cas2_eq && cmp_flags[2]) : cmp_flags[2];
+			// (the same, and no exception: the DMU's store valid from a
+			// flip-flop -- wb_exc's compare sat on the stall chain)
+			wb_stv      <= (ex_u.mem == M_ST || ex_u.mem == M_RMW) && !ex_stkill &&
+			               ex_u.exc == 8'd0 && !ex_fault && ex_xvec == 8'd0 && !ex_odd;
+			wb_ok       <= ex_u.exc == 8'd0 && !ex_fault && ex_xvec == 8'd0 && !ex_odd;
 			wb_st_data  <= ex_st;
 			// a store into the instruction stream just ahead (the fetch
 			// queue and the instructions in flight) refetches after itself:
@@ -1604,21 +1810,27 @@ always_ff @(posedge clk) begin
 			wb_redir    <= ex_mispred || ex_u.ser || ex_sr_we ||
 			               (ex_u.last && (smc_pend || ex_smc));
 			wb_eredir   <= ex_early;
+			// (the return stack to restore is read only with ras_rv, which
+			// pulses with a redirect: it is loaded every advance, so the
+			// late early-redirect decision is not its enable; WB's later
+			// loads take precedence)
+			{ras_rtp, ras_rn} <= ras_after(ex_u.ras);
 			if (ex_early) begin
 				fe_flush    <= 1'b1;
 				redir_v     <= 1'b1;
 				redir_pc    <= ex_next;
 				ras_rv      <= ex_u.ras.v;
-				{ras_rtp, ras_rn} <= ras_after(ex_u.ras);
 				eredir_pend <= 1'b1;
 			end
 			if (ex_u.last) smc_pend <= 1'b0;
 			else if (ex_smc) smc_pend <= 1'b1;
 			// where execution continues, predicted correctly or not
-			wb_redir_pc <= ex_br ? ex_next : ex_u.npc;
+			wb_redir_pc <= ex_br ? ex_next : ex_npc;
 			wb_sr_we    <= ex_sr_we;
 			wb_cof      <= ex_br && ex_taken;
 			wb_sr_new   <= ex_sr_new;
+			if (ex_u.op == OP_CAS2C)
+				cas2_eq <= ex_u.cond[0] ? (cas2_eq && cmp_flags[2]) : cmp_flags[2];
 			if (ex_u.exc == EXC_SNR) begin
 				wb_exc      <= EXC_IFS;     // refetched by WB, never an error
 				wb_exc_addr <= ex_u.pc;
@@ -1677,7 +1889,7 @@ always_ff @(posedge clk) begin
 			wb_xcommit  <= 1'b0;
 			if (ex_u.exc == 8'd0 && !ex_fault && ex_is_fp && ex_xvec != 8'd0) begin
 				wb_exc_pcv  <= 1'b1;
-				wb_exc_pc   <= fp_xnext ? ex_u.npc : ex_u.pc;
+				wb_exc_pc   <= fp_xnext ? ex_npc : ex_u.pc;
 				wb_exc_fmtv <= 1'b1;
 				wb_exc_fmt  <= fp_xfmt;
 				wb_xcommit  <= fp_xcommit;
@@ -1718,6 +1930,9 @@ always_ff @(posedge clk) begin
 			end
 			if (ex_u.op == OP_BF) bf_lonew <= bf_lo_out;
 		end
+		// (not when the next uop enters EX this cycle: the reset above is
+		// for it, and the done belongs to the one leaving)
+		if (md_done && md_go && !adv_dc2) md_fin <= 1'b1;
 		if (md_done) begin
 			md_rem  <= md_hi;
 			md_lol  <= md_lo;
@@ -1734,6 +1949,8 @@ always_ff @(posedge clk) begin
 			// architectural commit: the back file's write ports (bwe)
 			ccr_b <= wb_ccr;
 			if (wb_u.op == OP_SPW) begin
+				// MOVEC to the 68040's control registers (masks: WinUAE
+				// m68k_move2c)
 				case (wb_u.imm_b[7:0])
 					8'h00: sfc_r  <= wb_res[2:0];
 					8'h01: dfc_r  <= wb_res[2:0];
@@ -1743,10 +1960,10 @@ always_ff @(posedge clk) begin
 					8'h05: itt1_r <= wb_res & 32'hFFFF_E364;
 					8'h06: dtt0_r <= wb_res & 32'hFFFF_E364;
 					8'h07: dtt1_r <= wb_res & 32'hFFFF_E364;
-					8'h09: vbr_r  <= wb_res;
-					8'h0D: mmusr_r <= wb_res;
-					8'h0E: urp_r  <= wb_res & 32'hFFFF_FE00;
-					8'h0F: srp_r  <= wb_res & 32'hFFFF_FE00;
+					8'h11: vbr_r  <= wb_res;
+					8'h15: mmusr_r <= wb_res;
+					8'h16: urp_r  <= wb_res & 32'hFFFF_FE00;
+					8'h17: srp_r  <= wb_res & 32'hFFFF_FE00;
 					default: ;
 				endcase
 			end
@@ -1756,7 +1973,7 @@ always_ff @(posedge clk) begin
 			end
 			if (wb_is_stop && !stop_traced) begin
 				stopped <= 1'b1;
-				stop_pc <= wb_u.npc;
+				stop_pc <= wb_npc;
 			end
 			if (wb_redir) begin
 				flush    <= 1'b1;
@@ -1778,6 +1995,7 @@ always_ff @(posedge clk) begin
 				cm_pend <= (wb_u.op == OP_RTE) && cm_n_v;
 				cm_ea   <= cm_n_ea;
 				cm_pc   <= wb_next;
+				cm_wr   = 1'b1;
 				if (wb_u.op == OP_RTE) cm_n_v <= 1'b0;
 			end
 		end
@@ -1797,7 +2015,7 @@ always_ff @(posedge clk) begin
 		// exception entry: a faulting/trapping uop (its effects discarded,
 		// trap flags kept), a trace after an instruction, or an interrupt
 		// at an instruction boundary.  The front file restarts from the
-		// back file plus this uop's committed writes; T8..T13 carry the
+		// back file plus this uop's committed writes; T5..T13 carry the
 		// routine's operands.
 		//------------------------------------------------------------------
 		if (x_go) begin
@@ -1810,7 +2028,8 @@ always_ff @(posedge clk) begin
 			fe_flush <= 1'b1;
 			redir_v  <= 1'b0;
 			ras_rv   <= 1'b0;
-			xw_ph    <= 2'd1;          // T5-T13 first, then exc_go
+			xw_ph    <= 3'd1;          // T8-T13 (and T5-T7) first, then exc_go
+			xi_f7    <= (x_fmt == 4'h7);
 			exc_kind <= x_kind;
 			exc_ssp  <= x_ssp;
 			xi_sr    <= x_osr;
@@ -1844,35 +2063,60 @@ always_ff @(posedge clk) begin
 		end
 
 		// exception entry, continued: three cycles of back-file writes
-		if (xw_ph != 2'd0) begin
-			xw_ph <= xw_ph + 2'd1;
-			if (xw_ph == 2'd3) begin
-				xw_ph  <= 2'd0;
+		// (five for a format $7 frame)
+		if (xw_ph != 3'd0) begin
+			xw_ph <= xw_ph + 3'd1;
+			if ((xw_ph == 3'd3 && !xi_f7) || xw_ph == 3'd5) begin
+				xw_ph  <= 3'd0;
 				exc_go <= 1'b1;
 			end
 		end
 
 		// front-valid bits: a front write makes the register's front copy
 		// current; a redirect, a refetch or an exception drops them all
-		for (int i = 0; i < 3; i++) if (fwe[i]) fv[fwa[i]] <= 1'b1;
+		// (AG's two writes as a mask formed without the advance, which
+		// gates the mask last: the stall chain stays off the decode)
+		begin
+			logic [31:0] m_ag, m_ex;
+			m_ag = (fwe_ag[0] ? (32'd1 << fwa[0]) : 32'd0) | (fwe_ag[1] ? (32'd1 << fwa[1]) : 32'd0);
+			m_ex = fwe[2] ? (32'd1 << fwa[2]) : 32'd0;
+			fv <= fv | (adv_ag ? m_ag : 32'd0) | m_ex;
+		end
 		if ((wb_commit && wb_redir) || wb_refetch || x_go) fv <= 32'd0;
+		// synthesis translate_off
+		if (fwe[0] != (adv_ag && fwe_ag[0]) || fwe[1] != (adv_ag && fwe_ag[1])) begin
+			$display("FAIL: the front writes %b, the advance %b and AG's %b", fwe, adv_ag, fwe_ag);
+			$finish;
+		end
+		// synthesis translate_on
 
 		// a store that took a bus error at WB becomes an access fault of
 		// its instruction (WB holds one cycle, then takes it)
 		if (wb_v && wb_st && dm_st_rdy && dm_st_fault && wb_exc == 8'd0) begin
+			wb_stv      <= 1'b0;
+			wb_ok       <= 1'b0;
 			wb_exc      <= 8'd2;
 			wb_exc_addr <= dm_st_faddr;
 			wb_exc_ssw  <= dm_st_fssw;
 		end
-		// maintenance done: WB completes next cycle; PTEST sets MMUSR
+		// maintenance done: WB completes next cycle; PTEST sets MMUSR; a
+		// push of CPUSH's that ended in TEA is an access error (7.6.1)
 		if (wb_v && wb_mt && mt_done) begin
 			mt_seen <= 1'b1;
 			if (wb_u.cond == 4'd5) mmusr_r <= mt_mmusr;
+			if (mt_fault && wb_exc == 8'd0) begin
+				wb_stv      <= 1'b0;
+				wb_ok       <= 1'b0;
+				wb_exc      <= 8'd2;
+				wb_exc_addr <= mt_faddr;
+				wb_exc_ssw  <= mt_fssw;
+			end
 		end
 		if (adv_wb) mt_seen <= 1'b0;
 
 		// RESET instruction: RSTO for 512 bus clocks, WB waits
 		if (wb_v && wb_reset && !rst_issued && !wb_is_exc) rst_issued <= 1'b1;
+		if (dbl_fault) halted <= 1'b1;
 		if (adv_wb) rst_issued <= 1'b0;
 
 		//------------------------------------------------------------------
@@ -1883,20 +2127,49 @@ always_ff @(posedge clk) begin
 			eredir_pend <= 1'b0;
 		end
 		else begin
-			// D2 -> AG (exactly when in_rdy says the uop is taken)
-			if (!stall_ag) ag_v <= in_v && !stopped;
-			if (!stall_ag && in_v && !stopped) begin
-				ag_u      <= in_u;
-				ag_u.disp <= in_u.dmv ? in_u.disp + {{24{in_u.dma[7]}}, in_u.dma} : in_u.disp;
+			// D2 (or the skid) -> AG
+			if (!stall_ag) ag_v <= ain_v && !stopped && !halted;
+			if (ag_take && ain_v) begin
+				ag_u      <= ain_u;
+				ag_ld     = 1'b1;
+				ag_u.disp <= ain_u.dmv ? ain_u.disp + {{24{ain_u.dma[7]}}, ain_u.dma} : ain_u.disp;
+			end
+			// the skid: emptied when AG takes it; filled by a popped uop AG
+			// did not take
+			if (sk_v) begin
+				if (ag_take) begin sk_v <= 1'b0; sk_vr <= 1'b0; end
+			end
+			else if (SKID && in_v && in_rdy && !ag_take) begin
+				sk_v  <= 1'b1;
+				sk_vr <= 1'b1;
+				sk_u  <= in_u;
 			end
 		end
+		if (flush || kill_now) begin sk_v <= 1'b0; sk_vr <= 1'b0; end
 		if (kill_now) begin
 			ag_v <= 1'b0; dc1_v <= 1'b0; dc2_v <= 1'b0; ex_v <= 1'b0; wb_v <= 1'b0;
 		end
 	end
+	cm_hit_q <= cm_rst ? ((ag_ld ? ain_u.pc : ag_u.pc) == 32'd0) :
+	            ag_ld  ? (cm_wr ? (ain_u.pc == wb_next) : (ain_u.pc == cm_pc)) :
+	                     (cm_wr ? (ag_u.pc  == wb_next) : (ag_u.pc  == cm_pc));
 end
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && cm_hit_q != (ag_u.pc == cm_pc)) begin
+		$display("FAIL: the registered MOVEM continuation compare %b, the PCs' %b", cm_hit_q, ag_u.pc == cm_pc);
+		$finish;
+	end
+// synthesis translate_on
 
-assign dm_st_v    = wb_v && wb_st && !wb_is_exc;
+assign dm_st_v    = wb_v && wb_stv;
+// synthesis translate_off
+always_ff @(posedge clk)
+	if (nreset && wb_v && (wb_stv != (wb_st && wb_exc == 8'd0) || wb_ok != (wb_exc == 8'd0))) begin
+		$display("FAIL: wb_stv %b, the store %b with exception %0d (pc %h)", wb_stv, wb_st, wb_exc, wb_u.pc);
+		$finish;
+	end
+// synthesis translate_on
 assign iack_lvl   = irq_lvl_r;
 assign rsto_req   = wb_v && wb_reset && !rst_issued && !wb_is_exc;
 assign dm_st_data = wb_st_data;
@@ -1907,14 +2180,29 @@ assign ucond      = 1'b0;
 // (branch taken / not taken / other) for one bus clock, else the present
 // status.  An exception's stacking (from its entry to the routine's last
 // uop) ends as a virtual JMP: supervisor, branch taken.
-logic xstk;
 always_ff @(posedge clk) begin
-	if (!nreset) xstk <= 1'b0;
+	if (!nreset) xstk <= 1'b1;               // reset processing
 	else if (x_go) xstk <= 1'b1;
 	else if (adv_wb && wb_u.last) xstk <= 1'b0;
 end
-assign pst_ev   = adv_wb && wb_u.last && !wb_is_exc;
+// the handler's first instruction: from the routine's end to that
+// instruction's completion (a refetch of it is no completion)
+always_ff @(posedge clk) begin
+	if (!nreset || x_go || halted) x_first <= 1'b0;
+	else if (adv_wb && wb_u.last && xstk) x_first <= 1'b1;
+	else if (wb_bound || (adv_wb && wb_is_exc && !wb_refetch)) x_first <= 1'b0;
+end
+always_ff @(posedge clk)
+	if (!nreset) xr_dbl <= 1'b1;             // (reset's routine)
+	else if (x_go) xr_dbl <= (x_vec == 8'd2 || x_vec == 8'd3);
+// IPEND: a request beats the mask; it negates once the interrupt is
+// recognized internally (7.8.1: "can precede the external interrupt
+// acknowledge bus cycle")
 assign irq_pending = irq_pend;
+// no instruction fetch from the moment STOP or RESET is at WB (no fetch
+// cycle may run with RSTO asserted), while stopped, or halted
+assign fetch_stop  = stopped || halted || (wb_v && (wb_is_stop || wb_reset));
+assign pst_ev   = adv_wb && wb_u.last && !wb_is_exc;
 assign pst_code = xstk ? 4'hB :
                   {sr_r[13], 1'b0,
                    (wb_cof || wb_redir) ? 2'b11 :
@@ -1929,7 +2217,7 @@ assign pst_st   = halted ? 4'h5 : stopped ? 4'hD : xstk ? 4'hF :
 always_ff @(posedge clk) begin
 	// a captured EX writer stays captured while it is in EX
 	if (adv_ex) begin cap_b <= 1'b0; cap_x <= 1'b0; end
-	if (!flush && !stall_ag && in_v && !stopped) begin
+	if (!flush && !stall_ag && ain_v && !stopped) begin
 		logic [31:0] b, x;
 		logic        cb, cx, eb, ex;
 		logic  [3:0] wb, wx;
@@ -1939,33 +2227,36 @@ always_ff @(posedge clk) begin
 		cx = 1'b0;
 		eb = 1'b0;
 		ex = 1'b0;
+		// (AG's own updates: here AG advances, so fwe[0..1] is just whether
+		// it holds one -- adv_ag, the end of the stall chain, stays off the
+		// data select)
 		for (int i = 0; i < 2; i++) begin
-			if (fwe[i] && fwa[i] == in_u.base) b = fwd[i];
-			if (fwe[i] && fwa[i] == in_u.idx)  x = fwd[i];
+			if (fwe_ag[i] && fwa[i] == ain_u.base) b = fwd[i];
+			if (fwe_ag[i] && fwa[i] == ain_u.idx)  x = fwd[i];
 		end
 		// the load entering EX, unless a younger writer is in AG or DC1
 		// (it will be waited for in any case)
-		if (dc2_cap && dc2_u.d_reg == in_u.base) begin b = dc2_capv; cb = 1'b1; end
-		if (dc2_cap && dc2_u.d_reg == in_u.idx)  begin x = dc2_capv; cx = 1'b1; end
+		if (dc2_capd && dc2_u.d_reg == ain_u.base) begin b = dc2_capv; cb = adv_dc2; end
+		if (dc2_capd && dc2_u.d_reg == ain_u.idx)  begin x = dc2_capv; cx = adv_dc2; end
 		// the youngest writer's early result (not the uop leaving AG:
 		// its result is loaded next cycle)
-		wb = yw(in_u.base);
-		wx = yw(in_u.idx);
-		if (!(ag_v && ag_u.d_v && ag_u.d_reg == in_u.base) && wb[2]) begin
+		wb = yw(ain_u.base);
+		wx = yw(ain_u.idx);
+		if (!(ag_v && ag_u.d_v && ag_u.d_reg == ain_u.base) && wb[2]) begin
 			b = ywv(wb[1:0]); eb = 1'b1; cb = 1'b0;
 		end
-		if (!(ag_v && ag_u.d_v && ag_u.d_reg == in_u.idx) && wx[2]) begin
+		if (!(ag_v && ag_u.d_v && ag_u.d_reg == ain_u.idx) && wx[2]) begin
 			ex = 1'b1; cx = 1'b0;
 		end
-		agb_q <= in_u.base_v ? b : 32'd0;
+		agb_q <= ain_u.base_v ? b : 32'd0;
 		// EX writing it this cycle: the register file read is a cycle
 		// early (unless a younger load or early result supplied it)
-		stale_b <= exw_ag && in_u.base_v && exw_reg == in_u.base && !cb && !eb;
-		stale_x <= exw_ag && in_u.idx_v  && exw_reg == in_u.idx  && !cx && !ex;
+		stale_b <= exw_ag && ain_u.base_v && exw_reg == ain_u.base && !cb && !eb;
+		stale_x <= exw_ag && ain_u.idx_v  && exw_reg == ain_u.idx  && !cx && !ex;
 		// (the early results are scaled beside the writer search)
-		agx_q <= !ex ? ixf(x, in_u) :
-		         (wx[1:0] == 2'd1) ? ixf(dc1_er, in_u) :
-		         (wx[1:0] == 2'd2) ? ixf(dc2_er, in_u) : ixf(ex_er, in_u);
+		agx_q <= !ex ? ixf(x, ain_u) :
+		         (wx[1:0] == 2'd1) ? ixf(dc1_er, ain_u) :
+		         (wx[1:0] == 2'd2) ? ixf(dc2_er, ain_u) : ixf(ex_er, ain_u);
 		cap_b <= cb;
 		cap_x <= cx;
 		erb   <= eb;
@@ -1982,9 +2273,9 @@ always_ff @(posedge clk) begin
 			// youngest's: AG keeps waiting for it)
 			if (stale_b && ag_u.base_v) agb_q <= exq_val;
 			stale_b <= exw_ag && ag_u.base_v && exw_reg == ag_u.base && !cap_b;
-			if (dc2_cap && ag_u.base_v && dc2_u.d_reg == ag_u.base) begin
+			if (dc2_capd && ag_u.base_v && dc2_u.d_reg == ag_u.base) begin
 				agb_q <= dc2_capv;
-				cap_b <= 1'b1;
+				if (adv_dc2) cap_b <= 1'b1;
 			end
 		end
 		if (yw_x[2]) begin
@@ -1996,9 +2287,9 @@ always_ff @(posedge clk) begin
 		else begin
 			if (stale_x) agx_q <= ixf(exq_val, ag_u);
 			stale_x <= exw_ag && ag_u.idx_v && exw_reg == ag_u.idx && !cap_x;
-			if (dc2_cap && dc2_u.d_reg == ag_u.idx) begin
+			if (dc2_capd && dc2_u.d_reg == ag_u.idx) begin
 				agx_q <= ixf(dc2_capv, ag_u);
-				cap_x <= 1'b1;
+				if (adv_dc2) cap_x <= 1'b1;
 			end
 		end
 	end
