@@ -108,7 +108,9 @@ set_global_assignment -name SEED 3
 #   1594e6f (AP68040 upstream main c21d1e8 + PR #10), 2026-10-19:
 #     seed 7: 32,609 ALMs (78%): hold -0.430 (clk_ram): TIMING NOT MET.
 #     seed 3: 32,610 ALMs (78%): TIMING MET, worst setup +0.343, hold +0.149.
-#             rbf md5 c0aea5d4.
+#             rbf md5 c0aea5d4.  Hardware: desktop 3 of 4 boots.
+#   d4c2995 + AP68040_DC_WRITETHROUGH, seed 3: 32,561 ALMs (78%), TIMING MET.
+#             rbf md5 afa02a1b.  Hardware: desktop 6 of 6 boots.
 set_global_assignment -name FITTER_AGGRESSIVE_ROUTABILITY_OPTIMIZATION ALWAYS
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ADAPTIVE=1"
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
@@ -124,6 +126,12 @@ set_global_assignment -name VERILOG_MACRO "NEXT_NO_DSP=1"
 # The pipelined AP68040 (rtl/next_ap68040.sv), as Minimig-AGA's AP68040 build:
 # no register retiming in the CPU (it adds ~6,000 registers for timing the core
 # does not need at 33 MHz; it closes 57 MHz without), synthesized for area.
+# Data cache write-through (rtl/ap68040/ap68040_dmu.sv cm_eff): DMA reads are
+# not snooped, so memory must stay current.  Hardware boot loops, 2026-10-19,
+# NeXTSTEP 3.3 on a dirty disk (fsck + reboot each time), 15 min limit:
+#   copyback, snoop on 3/4 (one hang at "Loading from disk"); copyback, snoop
+#   off 4/4; write-through, snoop on 6/6 (524-528 s); 20261010 4/4.
+set_global_assignment -name VERILOG_MACRO "AP68040_DC_WRITETHROUGH=1"
 set_instance_assignment -name PHYSICAL_SYNTHESIS_REGISTER_RETIMING OFF -to "emu:emu|tc_machine:machine|next_ap68040:cpu|ap68040:cpu"
 set_instance_assignment -name OPTIMIZATION_TECHNIQUE AREA -to "emu:emu|tc_machine:machine|next_ap68040:cpu|ap68040:cpu"
 

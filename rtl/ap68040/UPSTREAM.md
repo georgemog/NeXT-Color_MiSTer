@@ -12,7 +12,9 @@ taken 2026-10-19.  `main` already carries the multiply/divide `md_fin` fix
 and its own fix (`q_flt`) of the fetch-fault decode deadlock that this
 tree's `8aaf25a` fixed for the older `ap68040-60mhz` copy.
 
-Local change: `ap68040.sv` exports `dbg_vbr`, `dbg_cacr` and `dbg_cmaint`
+Local changes: `ap68040_dmu.sv` can take copyback pages as write-through
+(`AP68040_DC_WRITETHROUGH`, set in NeXT-Color.qsf: DMA reads are not
+snooped); `ap68040.sv` exports `dbg_vbr`, `dbg_cacr` and `dbg_cmaint`
 (as Minimig-AGA's copy does); `rtl/next_ap68040.sv` uses them.
 
 ## The NeXT side
