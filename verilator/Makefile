@@ -13,7 +13,7 @@ RTL  = ../rtl
 AP   = ../rtl/ap68040
 V_INC = +incdir+$(RTL) +incdir+$(AP) +incdir+$(AP)/fpu +incdir+$(AP)/gen -I$(AP) -I$(AP)/fpu
 
-V_DEFINE = +define+SIMULATION=1 +define+AP68040_DC_WRITETHROUGH=1 \
+V_DEFINE = +define+SIMULATION=1 \
 	--timescale-override 1ps/1ps -Wno-TIMESCALEMOD -I$(RTL)
 V_DEFINE += -Wno-fatal -Wno-WIDTH -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-IMPLICIT \
 	-Wno-PINMISSING -Wno-UNUSEDSIGNAL -Wno-UNOPTFLAT -Wno-CASEINCOMPLETE \

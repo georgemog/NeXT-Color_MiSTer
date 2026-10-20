@@ -117,7 +117,10 @@ reg         alt_ta_n;
 
 ap68040 #(
 	.FPU_REVISION(FPU_REVISION),
-	.FPU_PIPE(FPU_PIPE), .LOOP_PRED(LOOP_PRED), .EARLY_RES(EARLY_RES)
+	.FPU_PIPE(FPU_PIPE), .LOOP_PRED(LOOP_PRED), .EARLY_RES(EARLY_RES),
+	// DMA reads are not snooped: memory must stay current (hardware boot
+	// loops 2026-10-19: copyback 3/4, write-through 6/6)
+	.DC_WRITETHROUGH(1)
 ) cpu (
 	.clk(clk), .bclk_en(1'b1), .rsti_n(nreset),
 	.a_o(a_o), .a_oe(),

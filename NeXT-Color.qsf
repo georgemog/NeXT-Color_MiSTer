@@ -126,12 +126,11 @@ set_global_assignment -name VERILOG_MACRO "NEXT_NO_DSP=1"
 # The pipelined AP68040 (rtl/next_ap68040.sv), as Minimig-AGA's AP68040 build:
 # no register retiming in the CPU (it adds ~6,000 registers for timing the core
 # does not need at 33 MHz; it closes 57 MHz without), synthesized for area.
-# Data cache write-through (rtl/ap68040/ap68040_dmu.sv cm_eff): DMA reads are
-# not snooped, so memory must stay current.  Hardware boot loops, 2026-10-19,
-# NeXTSTEP 3.3 on a dirty disk (fsck + reboot each time), 15 min limit:
-#   copyback, snoop on 3/4 (one hang at "Loading from disk"); copyback, snoop
-#   off 4/4; write-through, snoop on 6/6 (524-528 s); 20261010 4/4.
-set_global_assignment -name VERILOG_MACRO "AP68040_DC_WRITETHROUGH=1"
+# Data cache write-through: next_ap68040 sets the core's DC_WRITETHROUGH (DMA
+# reads are not snooped).  Hardware boot loops, 2026-10-19, NeXTSTEP 3.3 on a
+# dirty disk (fsck + reboot each time), 15 min limit: copyback, snoop on 3/4
+# (one hang at "Loading from disk"); copyback, snoop off 4/4; write-through,
+# snoop on 6/6 (524-528 s); 20261010 4/4.
 set_instance_assignment -name PHYSICAL_SYNTHESIS_REGISTER_RETIMING OFF -to "emu:emu|tc_machine:machine|next_ap68040:cpu|ap68040:cpu"
 set_instance_assignment -name OPTIMIZATION_TECHNIQUE AREA -to "emu:emu|tc_machine:machine|next_ap68040:cpu|ap68040:cpu"
 
