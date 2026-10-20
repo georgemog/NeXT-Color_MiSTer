@@ -55,7 +55,11 @@ module ap68040_dmu
 #(
 	// DC1's own ATC read port and tag compare beside xlate (65 MHz timing;
 	// 0: DC1's hit and way are xlate's, the port is not built)
-	parameter bit DC1_ATC = 0
+	parameter bit DC1_ATC = 0,
+	// copyback pages (CM 01, from a TTR or a page descriptor) are cached
+	// write-through: for a system whose DMA reads are not snooped (SC 00),
+	// where memory must always be current
+	parameter bit DC_WRITETHROUGH = 0
 )
 (
 	input  logic        clk,
@@ -530,15 +534,9 @@ ap68040_atc #(.SAME_SEARCH(0), .EXT_SET(1)) datc (
 //--------------------------------------------------------------------------
 // translation and cache tag compare of a lookup
 //--------------------------------------------------------------------------
-// NeXT-Color: AP68040_DC_WRITETHROUGH makes every copyback page write-
-// through (CM 01 -> 00), keeping memory current for DMA reads, which the
-// platform does not snoop.
+// the cache mode used: DC_WRITETHROUGH takes copyback as write-through
 function automatic logic [1:0] cm_eff(input logic [1:0] cm);
-`ifdef AP68040_DC_WRITETHROUGH
-	cm_eff = (cm == 2'b01) ? 2'b00 : cm;
-`else
-	cm_eff = cm;
-`endif
+	cm_eff = (DC_WRITETHROUGH && cm == 2'b01) ? 2'b00 : cm;
 endfunction
 
 function automatic xres_t xlate(input logic [31:0] la, input logic s, input logic wr,
