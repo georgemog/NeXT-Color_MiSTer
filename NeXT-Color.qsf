@@ -121,8 +121,9 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_YC=1"
 # No OSD on the analog output (HDMI keeps it): sys/sys_top.v carries
 # MacQuadra800_MiSTer's MISTER_DISABLE_VGA_OSD switch; ~514 ALMs (2026-09-27).
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_VGA_OSD=1"
-# the DSP56001 (tc_dsp + Main next_dsp) is parked: its registers read 0
-set_global_assignment -name VERILOG_MACRO "NEXT_NO_DSP=1"
+# the DSP56001 runs in the FPGA (tc_dsp56k + rtl/dsp56k).  NEXT_DSP_ARM=1
+# selects the DSP on the ARM instead (tc_dsp + Main next_dsp), NEXT_NO_DSP=1
+# leaves it out (registers read 0)
 # The pipelined AP68040 (rtl/next_ap68040.sv), as Minimig-AGA's AP68040 build:
 # no register retiming in the CPU (it adds ~6,000 registers for timing the core
 # does not need at 33 MHz; it closes 57 MHz without), synthesized for area.

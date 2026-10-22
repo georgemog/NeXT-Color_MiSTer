@@ -34,22 +34,57 @@
 //   - With SHFD set Hatari's bit swap can produce a 25-bit RX value; RX keeps
 //     the low 24 bits.
 
-module dsp_periph (
+// NeXT-Color changes (next_dsp_periph; Previous r1851 src/dsp/dsp_core.c,
+// dsp.c, sysReg.c):
+//   - The 68040 reaches the host port as two longwords at $02008000
+//     (ICR CVR ISR IVR) and $02008004 (TRX0 RXH/TXH RXM/TXM RXL/TXL), byte
+//     enables be[3:0] = bytes 0..3 of the longword (big-endian); the bytes of
+//     one access are handled in address order, as Previous's byte loop.
+//   - A DMA byte port (dma_*) for the PC chip's DSP channel: one host
+//     register byte per strobe, read or written exactly as a CPU byte access
+//     (DSP_HandleDMA -> dsp_core_read_host / dsp_core_write_host).
+//   - ICR HM (bits 6:5) select DMA mode: ISR bit 6 (DMA) follows HM != 0
+//     and the DMA direction is latched at an ICR write in DMA mode (to the
+//     DSP only with TREQ alone, dsp.c:154); init_pulse marks an ICR INIT.
+//   - rst is the machine reset or the SCR2 DSP_RESET 1 -> 0 edge
+//     (DSP_Reset); the host port stays live while DSP_RESET is 0, as in
+//     Previous.  At DSP_RESET 0 -> 1 (DSP_Start) start_mode applies: mode 1
+//     takes the host bootstrap (TXL words and ICR HF0 only from then on),
+//     mode 0 / 2 start at once (run_direct, dsp_core_start).
+//   - Port C: PCC (X:$FFE1) is kept; a PCD write with PCC bit 1 and PCDDR
+//     bit 1 set drives the TXD interrupt line, txd_low = !PCD bit 1
+//     (dsp_core_setPortCDataRegister -> DSP_HandleTXD).
+//   - The SSI is left in place; the NeXT-Color top ties its slot link off.
+
+module next_dsp_periph (
     input             clk,
     input             rst,             // DSP reset (dsp_core_reset)
 
-    // 68030 side (contract register bus, $FFA200-$FFA207)
-    input             bus_cs,
+    // 68040 side: a longword access at $02008000 + {bus_addr2, 2'b00}
     input             bus_stb,
     input             bus_we,
-    input       [2:1] bus_addr,
-    input             bus_uds,
-    input             bus_lds,
-    input      [15:0] bus_din,
-    output     [15:0] bus_dout,
-    output            bus_ack,
+    input             bus_addr2,
+    input       [3:0] bus_be,
+    input      [31:0] bus_din,
+    output     [31:0] bus_dout,        // combinational, before this clock's changes
     output            hreq,
     output      [7:0] ivr,
+    // DMA byte port (the PC chip's DSP channel), never in a bus_stb clock
+    input             dma_stb,
+    input             dma_we,
+    input       [2:0] dma_addr,
+    input       [7:0] dma_din,
+    output      [7:0] dma_dout,        // combinational
+    output      [1:0] dma_mode,        // ICR HM
+    output reg        dma_tx,          // DMA to the DSP (TREQ alone at the last ICR write)
+    output reg        init_pulse,      // an ICR write with INIT
+    // NeXT start mode and port C
+    input             dsp_run,         // SCR2 DSP_RESET (1 = run); rst pulses at its 1 -> 0 edge
+    input       [1:0] start_mode,
+    output reg        run_direct,      // with run_start: no bootstrap
+    output reg        txd_low,
+    output      [7:0] icr_o,           // ICR, ISR (the DMA engine's request)
+    output      [7:0] isr_o,
 
     // bootstrap / run control
     output reg        running /*verilator public_flat_rw*/,
@@ -125,8 +160,12 @@ module dsp_periph (
     reg [23:0] pcddr /*verilator public_flat_rw*/, pcd /*verilator public_flat_rw*/;
     reg [23:0] scr /*verilator public_flat_rw*/, ssr /*verilator public_flat_rw*/, sccr /*verilator public_flat_rw*/;
     reg [127:0] pvalid /*verilator public_flat_rw*/;  // backing store entries written since reset
+    reg        started;                    // the start mode has been applied since the reset
+    reg [23:0] pcc;                        // port C control (NeXT TXD interrupt)
 
     assign hreq   = isr[7];
+    assign icr_o  = icr;
+    assign isr_o  = isr;
     assign ivr    = ivr_r;
     assign int_host_rcv = hsr[0];
     assign int_host_trx = hsr[1];
@@ -233,8 +272,10 @@ module dsp_periph (
             default: host_byte = rxl;
         endcase
     endfunction
-    assign bus_dout = {host_byte({bus_addr, 1'b0}), host_byte({bus_addr, 1'b1})};
-    assign bus_ack  = bus_cs && bus_stb;
+    assign bus_dout = {host_byte({bus_addr2, 2'd0}), host_byte({bus_addr2, 2'd1}),
+                       host_byte({bus_addr2, 2'd2}), host_byte({bus_addr2, 2'd3})};
+    assign dma_dout = host_byte(dma_addr);
+    assign dma_mode = icr[6:5];
 
     // ------------------------------------------------------------------
     // sequential behaviour, written as Hatari's functions on working copies
@@ -243,7 +284,8 @@ module dsp_periph (
     reg  [7:0] v_hsr;
     reg  [4:0] v_hcr;
     reg [23:0] v_htx, v_rtx;
-    reg        v_running, v_run_start;
+    reg        v_running, v_run_start, v_run_direct, v_started, v_dma_tx, v_init, v_txd;
+    reg [23:0] v_pcc;
     reg  [9:0] v_boot_pos;
     reg        v_boot_we;
     reg  [8:0] v_boot_addr;
@@ -286,12 +328,16 @@ module dsp_periph (
             3'd0: begin
                 v_icr = d & 8'hfb;
                 v_hsr[4:3] = v_icr[4:3];
+                // PIO or DMA mode (dsp_core_write_host)
+                v_isr[6] = (v_icr[6:5] != 2'd0);
+                if (v_icr[6:5] != 2'd0) v_dma_tx = v_icr[1] && !v_icr[0];
                 if (v_icr[7]) begin
+                    v_init = 1'b1;
                     if (v_icr[0]) begin v_isr[0] = 1'b0; v_hsr[1] = 1'b1; end
                     if (v_icr[1]) begin v_isr[1] = 1'b1; v_hsr[0] = 1'b0; end
                     v_icr[7] = 1'b0;
                 end
-                if (!v_running && v_icr[3]) begin
+                if (!v_running && v_started && v_icr[3]) begin
                     v_running = 1'b1; v_run_start = 1'b1;
                 end
                 upd_hreq;
@@ -305,7 +351,7 @@ module dsp_periph (
             3'd6: v_txm = d;
             3'd7: begin
                 v_txl = d;
-                if (!v_running) begin
+                if (!v_running && v_started) begin
                     v_boot_we = 1'b1;
                     v_boot_addr = v_boot_pos[8:0];
                     v_boot_data = {v_txh, v_txm, v_txl};
@@ -345,6 +391,8 @@ module dsp_periph (
         v_rxh = rxh; v_rxm = rxm; v_rxl = rxl; v_txh = txh; v_txm = txm; v_txl = txl;
         v_hsr = hsr; v_hcr = hcr; v_htx = htx; v_rtx = rtx;
         v_running = running; v_run_start = 1'b0; v_boot_pos = boot_pos;
+        v_run_direct = run_direct; v_started = started; v_dma_tx = dma_tx; v_init = 1'b0;
+        v_txd = txd_low; v_pcc = pcc;
         v_boot_we = 1'b0; v_boot_addr = boot_addr; v_boot_data = boot_data;
         v_cra = cra; v_crb = crb; v_tx = ssi_tx; v_rx = ssi_rx; v_ssisr = ssisr;
         v_tval = ssi_tval; v_rval = ssi_rval; v_wait_tx = wait_tx; v_wait_rx = wait_rx;
@@ -352,6 +400,14 @@ module dsp_periph (
         v_txvalid = ssi_tx_valid; v_hsplay = 1'b0;
         v_ipr = ipr; v_bcr = bcr; v_pcddr = pcddr; v_pcd = pcd; v_scr = scr; v_ssr = ssr; v_sccr = sccr;
         rdv = 24'd0; rspec = 1'b0; t25 = 25'd0;
+
+        // ---------------- start (dsp_core_start): mode 0 / 2 run at once ----------------
+        if (!v_started && dsp_run) begin
+            v_started = 1'b1;
+            if (start_mode != 2'd1) begin
+                v_running = 1'b1; v_run_start = 1'b1; v_run_direct = 1'b1;
+            end
+        end
 
         // ---------------- SSI slot (crossbar) ----------------
         if (ssi_slot_stb && ssi_tx_en) begin
@@ -457,9 +513,11 @@ module dsp_periph (
                 end
                 6'h3f: v_ipr = perx_wdata;
                 6'h3e: v_bcr = perx_wdata;
+                6'h21: v_pcc = perx_wdata;             // PCC (also in the backing store)
                 6'h23: v_pcddr = perx_wdata;
                 6'h25: begin                           // dsp_core_setPortCDataRegister
                     v_pcd = perx_wdata;
+                    if (v_pcc[1] && v_pcddr[1]) v_txd = !perx_wdata[1];   // DSP_HandleTXD
                     if (v_pcddr[4] && perx_wdata[4]) begin
                         v_wait_rx = 1'b0;
                         v_hsplay = 1'b1;               // SC1 -> Crossbar_DmaPlayInHandShakeMode
@@ -495,15 +553,25 @@ module dsp_periph (
             v_scr = 24'd0; v_ssr = 24'd3; v_sccr = 24'd0;
         end
 
-        // ---------------- 68030 bus access ----------------
-        if (bus_cs && bus_stb) begin
+        // ---------------- 68040 bus access, bytes in address order ----------------
+        if (bus_stb) begin
             if (bus_we) begin
-                if (bus_uds) write_host({bus_addr, 1'b0}, bus_din[15:8]);
-                if (bus_lds) write_host({bus_addr, 1'b1}, bus_din[7:0]);
+                if (bus_be[3]) write_host({bus_addr2, 2'd0}, bus_din[31:24]);
+                if (bus_be[2]) write_host({bus_addr2, 2'd1}, bus_din[23:16]);
+                if (bus_be[1]) write_host({bus_addr2, 2'd2}, bus_din[15:8]);
+                if (bus_be[0]) write_host({bus_addr2, 2'd3}, bus_din[7:0]);
             end else begin
-                if (bus_uds) read_host({bus_addr, 1'b0});
-                if (bus_lds) read_host({bus_addr, 1'b1});
+                if (bus_be[3]) read_host({bus_addr2, 2'd0});
+                if (bus_be[2]) read_host({bus_addr2, 2'd1});
+                if (bus_be[1]) read_host({bus_addr2, 2'd2});
+                if (bus_be[0]) read_host({bus_addr2, 2'd3});
             end
+        end
+
+        // ---------------- DMA byte (DSP_HandleDMA) ----------------
+        if (dma_stb) begin
+            if (dma_we) write_host(dma_addr, dma_din);
+            else read_host(dma_addr);
         end
 
     end
@@ -513,6 +581,8 @@ module dsp_periph (
         rxh <= v_rxh; rxm <= v_rxm; rxl <= v_rxl; txh <= v_txh; txm <= v_txm; txl <= v_txl;
         hsr <= v_hsr; hcr <= v_hcr; htx <= v_htx; rtx <= v_rtx;
         running <= v_running; run_start <= v_run_start; boot_pos <= v_boot_pos;
+        run_direct <= v_run_direct; started <= v_started; dma_tx <= v_dma_tx;
+        init_pulse <= v_init; txd_low <= v_txd; pcc <= v_pcc;
         boot_we <= v_boot_we; boot_addr <= v_boot_addr; boot_data <= v_boot_data;
         cra <= v_cra; crb <= v_crb; ssi_tx <= v_tx; ssi_rx <= v_rx; ssisr <= v_ssisr;
         ssi_tval <= v_tval; ssi_rval <= v_rval; wait_tx <= v_wait_tx; wait_rx <= v_wait_rx;
@@ -532,6 +602,8 @@ module dsp_periph (
             icr <= 8'h00; cvr <= 8'h12; isr <= 8'h06; ivr_r <= 8'h0f;
             hsr <= 8'h02; hcr <= 5'd0; htx <= 24'd0; rtx <= 24'd0;
             running <= 1'b0; run_start <= 1'b0; boot_pos <= 10'd0; boot_we <= 1'b0;
+            run_direct <= 1'b0; started <= 1'b0; dma_tx <= 1'b0; init_pulse <= 1'b0;
+            txd_low <= 1'b0; pcc <= 24'd0;
             cra <= 24'd0; crb <= 24'd0; ssisr <= 8'h40;
             ssi_tx <= 24'd0; ssi_rx <= 24'd0;
             wait_tx <= 1'b1; wait_rx <= 1'b1; hs_frame <= 1'b0;
