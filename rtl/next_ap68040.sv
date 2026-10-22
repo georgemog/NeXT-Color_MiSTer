@@ -71,12 +71,14 @@ module next_ap68040
 	parameter        LOOP_PRED    = 0,
 	parameter        EARLY_RES    = 0,
 	parameter        SNOOP        = 2,             // 1: snoop DMA writes after the fact; 2: flush lines before DMA
+	parameter        CPU2X        = 1,             // the core on clk_cpu = 2 x clk, its bus on every other edge
 	parameter [7:0]  NOCACHE_PAGE = 8'h02,         // physical [31:24] read with TCI
 	parameter [31:0] POST_LO      = 32'h0400_0000, // posted stores [POST_LO, POST_HI):
 	parameter [31:0] POST_HI      = 32'h0D00_0000  //   NeXT RAM + VRAM
 )
 (
-	input         clk,
+	input         clk,            // the machine clock (tc_machine's side of every port)
+	input         clk_cpu,        // 2 x clk, edges aligned (CPU2X = 1; unused otherwise)
 	input         nreset,
 
 	input   [2:0] ipl,            // active low
@@ -121,6 +123,38 @@ module next_ap68040
 localparam [1:0] SIZ_L = 2'b00, SIZ_B = 2'b01, SIZ_W = 2'b10, SIZ_LINE = 2'b11;
 
 //----------------------------------------------------------------------------
+// clocks (CPU2X).  The core runs on clk_cpu, twice clk with aligned edges;
+// its bus clock enable bclk_en is high in the clk_cpu cycles that end on a
+// clk edge (BCLK = PCLK / 2, MC68040UM 7.1).  Everything else in this module
+// -- the transfer FSM, the store buffer, the snoop presenter -- runs on
+// clk_cpu under the same enable, so every port to tc_machine changes and is
+// sampled only on clk edges: to tc_machine this is the 33 MHz CPU it was.
+// The paths between these registers and clk are two clk_cpu cycles
+// (NeXT-Color.sdc).  ipl and nreset are registered on an enabled edge before
+// they reach the core.
+//----------------------------------------------------------------------------
+wire pclk = CPU2X ? clk_cpu : clk;
+reg  bclk_en = 1'b1;
+generate if (CPU2X) begin : g_bclk
+	reg ph_sys = 1'b0;           // flips on every clk edge
+	reg ph_cpu = 1'b0;           // ph_sys as clk_cpu saw it one edge ago
+	always @(posedge clk)  ph_sys <= ~ph_sys;
+	// high in the clk_cpu cycle that ends on the next clk edge: ph_sys was
+	// sampled before its last flip and has flipped since
+	always @(posedge pclk) begin
+		ph_cpu  <= ph_sys;
+		bclk_en <= (ph_cpu != ph_sys);
+	end
+end endgenerate
+
+reg        nrst_q = 1'b0;
+reg  [2:0] ipl_q  = 3'b111;
+always @(posedge pclk) if (bclk_en) begin
+	nrst_q <= nreset;
+	ipl_q  <= ipl;
+end
+
+//----------------------------------------------------------------------------
 // the processor
 //----------------------------------------------------------------------------
 wire [31:0] a_o, d_o, vbr, cacr;
@@ -150,7 +184,7 @@ ap68040 #(
 	// (hardware boot loops 2026-10-19: copyback 3/4, write-through 6/6)
 	.DC_WRITETHROUGH(0)
 ) cpu (
-	.clk(clk), .bclk_en(1'b1), .rsti_n(nreset),
+	.clk(pclk), .bclk_en(bclk_en), .rsti_n(nrst_q),
 	.a_o(a_o), .a_oe(),
 	.a_i(alt_a), .ts_n_i(alt_ts_n), .rw_n_i(alt_rd), .siz_i(alt_ln ? SIZ_LINE : SIZ_L), .tt_i(2'b00),
 	.sc(2'b10), .mi_n(mi_n), .ta_n_o(sn_ta_n), .ta_oe(sn_ta_oe),
@@ -159,7 +193,7 @@ ap68040 #(
 	.ciout_n(ciout_n), .lock_n(), .locke_n(),
 	.ts_n(ts_n), .tip_n(tip_n),
 	.ta_n(ta_n & alt_ta_n), .tea_n(tea_n), .tci_n(tci_n), .tbi_n(1'b1),
-	.ipl_n(ipl), .avec_n(avec_n),
+	.ipl_n(ipl_q), .avec_n(avec_n),
 	.br_n(), .bg_n(bg_n),
 	.bb_n_i(bb_oe ? bb_n_o : 1'b1), .bb_n_o(bb_n_o), .bb_oe(bb_oe),
 	.rsto_n(rsto_n), .cdis_n(1'b1), .mdis_n(1'b1), .ipend_n(), .pst(),
@@ -220,8 +254,8 @@ function [2:0] tm_fc;
 	end
 endfunction
 
-always @(posedge clk) begin
-	if (!nreset) begin
+always @(posedge pclk) if (bclk_en) begin
+	if (!nrst_q) begin
 		cst    <= C_IDLE;
 		ta_n   <= 1'b1;
 		tea_n  <= 1'b1;
@@ -303,9 +337,9 @@ end
 // through wombat_store_buffer as under wombat_cpu: acknowledged the clock
 // after capture, drained in order; everything else waits for its own answer.
 wombat_store_buffer #(.ENABLE(1), .POST_LO(POST_LO), .POST_HI(POST_HI)) store_buffer (
-	.clk(clk),
-	.nreset(nreset),
-	.ce(1'b1),
+	.clk(pclk),
+	.nreset(nrst_q),
+	.ce(bclk_en),
 	.buffer_writes(1'b1),
 
 	.s_req(c_req),
@@ -356,8 +390,8 @@ wire        q_dup  = q_last_v && (q_last == snoop_addr[31:4]);
 wire        q_push = (SNOOP == 1) && snoop_stb && !q_dup;
 assign snoop_full = (q_n >= QD - 1);
 
-always @(posedge clk) begin
-	if (!nreset) begin
+always @(posedge pclk) if (bclk_en) begin
+	if (!nrst_q) begin
 		q_wp     <= 0;
 		q_rp     <= 0;
 		q_n      <= 0;
@@ -380,8 +414,8 @@ always @(posedge clk) begin
 	end
 end
 
-always @(posedge clk) begin
-	if (!nreset) begin
+always @(posedge pclk) if (bclk_en) begin
+	if (!nrst_q) begin
 		nst      <= N_IDLE;
 		bg_n     <= 1'b0;
 		alt_ts_n <= 1'b1;
@@ -509,7 +543,7 @@ reg  [5:0] d_wp = 0;
 // one stack line (VA $1113DA60-6F): committed loads/stores, and bus
 // transfers whose page offset matches (its PA is not known up front)
 reg [31:0] ln_n = 0;
-always @(posedge clk) if (nreset && trc_cyc > 64'd1119700000 && ln_n < 3000) begin
+always @(posedge pclk) if (nrst_q && trc_cyc > 64'd1119700000 && ln_n < 3000) begin
 	if (cpu.be.wb_commit && (cpu.dmu.m4.r.a[31:5] == 27'h0889ed3 || cpu.dmu.m4.r.a[31:5] == 27'h0889ed4) && (cpu.be.wb_st || cpu.be.wb_dwe)) begin
 		ln_n <= ln_n + 1;
 		$display("[A040] LN @%0d pc=%h va=%h st=%b st_data=%h dwe=%b d_reg=%0d res=%h", trc_cyc, cpu.be.wb_u.pc,
@@ -538,7 +572,7 @@ end
 
 // stack_attach ($040A29F6..$040A2A28): every committed uop
 reg [31:0] sa_n = 0;
-always @(posedge clk) if (nreset) begin
+always @(posedge pclk) if (nrst_q) begin
 	if (cpu.be.wb_commit && cpu.be.wb_u.pc >= 32'h040a29f6 && cpu.be.wb_u.pc <= 32'h040a2a28 && sa_n < 2000) begin
 		sa_n <= sa_n + 1;
 		$display("[A040] SA @%0d pc=%h op=%0d dwe=%b d_reg=%0d res=%h st=%b st_data=%h m4a=%h", trc_cyc, cpu.be.wb_u.pc,
@@ -548,7 +582,7 @@ end
 
 // who stores $1112400C; the context switch's register loads
 reg [31:0] sv_n = 0;
-always @(posedge clk) if (nreset) begin
+always @(posedge pclk) if (nrst_q) begin
 	if (cpu.be.wb_commit && cpu.be.wb_st && cpu.be.wb_st_data == 32'h1112400C && sv_n < 50) begin
 		sv_n <= sv_n + 1;
 		$display("[A040] ST1112 @%0d pc=%h va=%h", trc_cyc, cpu.be.wb_u.pc, cpu.dmu.m4.r.a);
@@ -565,7 +599,7 @@ end
 reg        pg_v = 0;
 reg [19:0] pg_pa = 0;
 reg [31:0] pg_n = 0;
-always @(posedge clk) if (nreset) begin
+always @(posedge pclk) if (nrst_q) begin
 	if (cpu.fetch.st != 3'd2 && cpu.fetch.st != 3'd3 && cpu.fetch.f1_v && 0) ;
 	if (cpu.fetch.b_req_r && cpu.fetch.m_la[31:16] == 16'h1112 && !pg_v) begin
 		pg_v  <= 1;
@@ -583,7 +617,7 @@ end
 // exceptions other than interrupts, traps and access faults; and the
 // decoder's illegal / line A / line F records
 reg [31:0] xc_n = 0, dx_n = 0;
-always @(posedge clk) if (nreset) begin
+always @(posedge pclk) if (nrst_q) begin
 	if (cpu.be.x_go && xc_n < 200 && !(cpu.be.x_vec >= 8'd24 && cpu.be.x_vec < 8'd48) && cpu.be.x_vec != 8'd2) begin
 		xc_n <= xc_n + 1;
 		$display("[A040] EXC @%0d vec=%0d pc=%h sr=%h", trc_cyc, cpu.be.x_vec, cpu.be.x_pc, cpu.sr);
@@ -608,7 +642,7 @@ always @(posedge clk) if (nreset) begin
 			cpu.win[0], cpu.win[1], cpu.win[2], cpu.win[3], cpu.win[4], cpu.win[5], cpu.qcnt, cpu.win_flt);
 	end
 end
-always @(posedge clk) begin
+always @(posedge pclk) begin
 	if (dbg_retire) begin
 		r_pc[r_wp] <= dbg_pc; r_cyc[r_wp] <= trc_cyc; r_wp <= r_wp + 1;
 	end
@@ -619,7 +653,7 @@ always @(posedge clk) begin
 		d_wp <= d_wp + 1;
 	end
 end
-always @(posedge clk) begin
+always @(posedge pclk) begin
 	trc_cyc  <= trc_cyc + 1;
 	trc_idle <= dbg_retire ? 0 : trc_idle + 1;
 	if (!ts_n) begin
@@ -657,8 +691,9 @@ always @(posedge clk) begin
 end
 `endif
 reg         flt_seen;
-always @(posedge clk)
-	if (!nreset) flt_seen <= 1'b0;
+always @(posedge pclk)
+	if (!bclk_en) ;
+	else if (!nrst_q) flt_seen <= 1'b0;
 	else if (!tea_n) flt_seen <= 1'b1;
 
 assign debug_fault   = flt_seen;
@@ -692,7 +727,7 @@ task pf_dump;
 			         pf_t[k*5+r] / pf_n[k*5+r], (pf_t[k*5+r] * 100 / pf_n[k*5+r]) % 100,
 			         pf_max[k*5+r], pf_t[k*5+r]);
 endtask
-always @(posedge clk) if (nreset) begin
+always @(posedge pclk) if (bclk_en && nrst_q) begin
 	pf_cyc <= pf_cyc + 1;
 	if (dbg_retire) pf_ret <= pf_ret + 1;
 	if (fl_done) begin pf_fl <= pf_fl + 1; if (fl_dirty) pf_fld <= pf_fld + 1; end

@@ -18,8 +18,15 @@
 //  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 //
 //  Clocks (structure from MacQuadra800_MiSTer, MacQuadra800.sv):
-//    clk_sys  33.000 MHz  CPU, devices (the real Turbo bus rate)
-//    clk_ram  99.000 MHz  SDRAM controller, exactly 3 x clk_sys (same PLL)
+//    clk_sys  25.000 MHz  the CPU bus, devices (the real Turbo bus is 33 MHz:
+//                         this one is set by clk_cpu, see below; CLK_HZ
+//                         keeps the devices' real-time rates)
+//    clk_ram  75.000 MHz  SDRAM controller, exactly 3 x clk_sys (same PLL)
+//    clk_cpu  50.000 MHz  the AP68040 core, 2 x clk_sys (same PLL; its bus
+//                         runs at clk_sys, rtl/next_ap68040.sv).  With the
+//                         DSP56001 in the FPGA (~95% full) 57 MHz did not
+//                         close on six seeds, so the whole PLL sits 24%
+//                         below the 33/99 MHz it had.
 //    clk_vid 100.000 MHz  pixel clock, own PLL (rtl/pll_vid.v)
 //
 //  Memory (docs/DECISIONS.md):
@@ -177,13 +184,16 @@ assign LED_DISK = {1'b0, sd_busy | sd_ack_v[4]};
 
 ///////////////////////   CLOCKS   ///////////////////////////////
 
-wire clk_sys, clk_ram, pll_locked;
+localparam CLK_SYS_HZ = 25000000;   // rtl/pll/pll_0002.v outclk_0
+
+wire clk_sys, clk_ram, clk_cpu, pll_locked;
 pll pll
 (
 	.refclk(CLK_50M),
 	.rst(0),
 	.outclk_0(clk_sys),
 	.outclk_1(clk_ram),
+	.outclk_2(clk_cpu),
 	.locked(pll_locked)
 );
 
@@ -289,9 +299,10 @@ wire   [7:0] pal_d;
 wire        vbl_pulse;
 wire        led;
 
-tc_machine machine
+tc_machine #(.CLK_HZ(CLK_SYS_HZ)) machine
 (
 	.clk(clk_sys),
+	.clk_cpu(clk_cpu),
 	.nreset(~reset),
 	.ce(1'b1),
 	.config_reset(config_reset),
@@ -421,7 +432,7 @@ tc_enet_ddr enet_ddr
 	.DDRAM_DIN(DDRAM_DIN), .DDRAM_BE(DDRAM_BE), .DDRAM_WE(DDRAM_WE)
 );
 
-tc_memsys memsys
+tc_memsys #(.RAM_HZ(3 * CLK_SYS_HZ)) memsys
 (
 	.clk_sys(clk_sys),
 	.clk_ram(clk_ram),

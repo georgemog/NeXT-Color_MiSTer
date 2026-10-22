@@ -17,6 +17,7 @@
 module emu
 (
 	input         clk_sys,
+	input         clk_cpu,       // the AP68040's clock, 2 x clk_sys (sim_main.cpp)
 	input         clk_ram,
 	input         reset,          // machine reset (held by sim_main.cpp)
 	input         config_reset,   // power-up: NVRAM default image
@@ -150,6 +151,7 @@ wire        fsd_ack = m_ack &  m_flp;
 tc_machine machine
 (
 	.clk(clk_sys),
+	.clk_cpu(clk_cpu),
 	.nreset(~reset),
 	.ce(1'b1),
 	.config_reset(config_reset),

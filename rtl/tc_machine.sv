@@ -45,6 +45,7 @@ module tc_machine
 )
 (
 	input         clk,
+	input         clk_cpu,                // the AP68040's clock, 2 x clk (next_ap68040 CPU2X)
 	input         nreset,
 	input         ce,
 	input         config_reset,           // power-up / OSD reset (NVRAM default image)
@@ -321,6 +322,7 @@ reg [127:0] wb_line;
 
 next_ap68040 #(.FPU_REVISION(8'h41)) cpu (
 	.clk(clk),
+	.clk_cpu(clk_cpu),
 	.nreset(nreset),
 
 	.ipl(~ipl),
@@ -452,7 +454,7 @@ wire [31:0] int_src = {int_tmc_nmi | int_kms_nmi,  // 31 INT_NMI
 // SCR1 / SCR2 / RTC
 wire [31:0] scr2;                      // SCR2's DSP bits -> tc_dsp
 wire [31:0] scr_rdata;  wire scr_ack;
-tc_scr scr (
+tc_scr #(.CLK_HZ(CLK_HZ)) scr (
 	.clk(clk), .reset(dev_rst), .config_reset(config_reset),
 	.stb(io_stb && (io_dev == D_SCR1 || io_dev == D_SCR2) && !io_tmc), .we(io_we),
 	.sel_scr2(io_dev == D_SCR2), .be(io_be), .wdata(io_wdata),
