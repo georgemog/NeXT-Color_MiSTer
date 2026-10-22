@@ -11,7 +11,7 @@ V = verilator
 TOP  = --top-module emu
 RTL  = ../rtl
 AP   = ../rtl/ap68040
-V_INC = +incdir+$(RTL) +incdir+$(AP) +incdir+$(AP)/fpu +incdir+$(AP)/gen -I$(AP) -I$(AP)/fpu
+V_INC = +incdir+$(RTL) +incdir+$(RTL)/dsp56k +incdir+$(AP) +incdir+$(AP)/fpu +incdir+$(AP)/gen -I$(AP) -I$(AP)/fpu
 
 V_DEFINE = +define+SIMULATION=1 \
 	--timescale-override 1ps/1ps -Wno-TIMESCALEMOD -I$(RTL)
@@ -67,6 +67,13 @@ V_SRC = \
 	$(RTL)/tc_scc.sv \
 	$(RTL)/tc_tdma.sv \
 	$(RTL)/tc_dsp.sv \
+	$(RTL)/tc_dsp56k.sv \
+	$(RTL)/dsp56k/dsp_ram.sv \
+	$(RTL)/dsp56k/dsp56k_rom.sv \
+	$(RTL)/dsp56k/dsp56k_alu.sv \
+	$(RTL)/dsp56k/dsp56k_dec.sv \
+	$(RTL)/dsp56k/dsp56k_core.sv \
+	$(RTL)/dsp56k/next_dsp_periph.sv \
 	$(RTL)/tc_scsi.sv \
 	$(RTL)/next_floppy.sv \
 	$(RTL)/next_enet_bridge.sv \
