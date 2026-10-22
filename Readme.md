@@ -16,7 +16,7 @@ colour desktop. Work in progress.
 | Floppy | 2.88 MB drive (720K, 1.44M and 2.88M images) |
 | Ethernet | On the MiSTer's LAN (optional) |
 | Sound out | 16-bit stereo, 44.1 and 22.05 kHz |
-| DSP56001 | Not in this release (see "Sound and DSP") |
+| DSP56001 | In the FPGA, 8K words of external RAM (see "Sound and DSP"); untested on hardware |
 | Sound in, DSP serial port, printer, ADB | Not present |
 
 * Design decisions: `docs/DECISIONS.md`. Hand-off state: the newest
@@ -185,19 +185,18 @@ be lost.
   stereo, 44.1 kHz; 22.05 kHz sounds are doubled as on the real machine;
   the keyboard's volume keys work). There is no sound input (no microphone
   CODEC) and no DSP port (the DSP's serial ports have no connector here).
-* **No DSP56001 in this release.** Its registers read 0, as in the releases
-  before the DSP work, so programs that need the DSP -- the Music Kit
-  (`playscore`, Music Kit applications) and sounds that NeXTSTEP decodes on
-  the DSP -- do not work. 16-bit linear sounds (the system beeps, `sndplay`
-  of 16-bit files) play.
-* The DSP work is parked, not dropped: the source has a DSP56001 running on
-  the MiSTer's ARM (the Previous emulator's interpreter in Main, branch
-  `next-color`, behind the FPGA's host port `rtl/tc_dsp.sv`), switched off by
-  `NEXT_NO_DSP` in `NeXT-Color.qsf`. It plays the Sound Kit's DSP sounds and
-  renders some Music Kit scores (`playscore -w`), but at an eighth of a real
-  56001's speed NeXTSTEP's sound driver resets it partway through heavier
-  scores. Where it stands: `docs/DECISIONS.md` ("Sound and DSP") and the newest
-  `RESUME-*.md`.
+* **The DSP56001 runs in the FPGA** (`rtl/tc_dsp56k.sv`, `rtl/dsp56k`): the
+  Falcon_MiSTer DSP56001 core (apolkosnik/Falcon_MiSTer `rtl/falcon/dsp`,
+  checked against Hatari instruction by instruction) with the NeXT's host
+  port, DSP DMA (packed and unpacked), SCR2 reset / start mode / memory
+  enable, IRQB at a DMA block end and the TXD interrupt.  It runs at the
+  machine clock: 14.25 MIPS, a little faster than a real 25 MHz 56001
+  (12.5 MIPS).  External RAM: the standard 8K words (24 KB); no 96 KB
+  expansion.  Not yet tried on hardware with the Music Kit or the Sound
+  Kit's DSP sounds.
+* The DSP on the ARM (Previous's interpreter in Main, `next-color`, behind
+  `rtl/tc_dsp.sv`) is still in the source: `NEXT_DSP_ARM` in
+  `NeXT-Color.qsf` selects it.  `NEXT_NO_DSP` leaves the DSP out.
 
 ## Troubleshooting
 
@@ -212,7 +211,6 @@ be lost.
 
 ## Known limitations
 
-* No DSP56001 in this release (above).
 * No sound input, no DSP serial port, no printer (its registers only), no
   ADB devices, no second display. The NVRAM is not saved.
 * The FPGA is nearly full (about 95% of its logic), so fitter results vary a
@@ -243,7 +241,8 @@ sets these:
 | `MISTER_DISABLE_ALSA` | yes (since the first build, from the MacQuadra800 recipe) | Removes the path that mixes Linux-side (ALSA) audio into the core's audio output; the NeXT's own sound is not affected |
 | `MISTER_DISABLE_YC` | yes (2026-09-27) | Removes the composite / S-Video (Y/C) encoder of the analog output. The NeXT picture has a 61.3 kHz line rate (1120x832 at 68.4 Hz), which no composite or S-Video input can show, so the encoder never had a use here; its logic and multipliers are freed |
 | `MISTER_DISABLE_VGA_OSD` | yes (2026-09-27) | No OSD menu on the analog output; HDMI keeps its OSD. Not a stock switch: `sys/sys_top.v` carries it from MacQuadra800_MiSTer's `sys/` (the analog video passes straight through, and the core's OSD-open input reads 0, which this core does not use). Frees ~514 ALMs |
-| `NEXT_NO_DSP` | yes (2026-09-28) | Leaves the DSP56001 host port (`rtl/tc_dsp.sv`) out; its registers read 0. Remove it (and use a Main from `next-color` with the DSP, 2026-09-27 or later) to run the DSP on the ARM |
+| `NEXT_NO_DSP` | no (on 2026-09-28 .. 2026-10-22) | Leaves the DSP56001 out; its registers read 0 |
+| `NEXT_DSP_ARM` | no | The DSP on the ARM (`rtl/tc_dsp.sv` + a Main from `next-color` with the DSP) instead of `rtl/tc_dsp56k.sv` in the FPGA |
 | `AP040_EXPERIMENTAL_XSTORE`, `AP040_EXPERIMENTAL_LEA` | yes | 68040 core options, as in the validated MacQuadra800 build: stores that cross a data-cache line, and a faster LEA/PEA address path |
 
 And leaves these off:
