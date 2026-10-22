@@ -303,6 +303,22 @@ reg         snoop_stb;        // a DMA write landed (service FSM below)
 reg  [31:2] snoop_line;
 wire        snoop_full;       // the CPU's snoop queue: hold DMA beats
 
+// DMA line flush (next_ap68040 SNOOP = 2): a DMA beat of a RAM line is
+// served only once that line has been flushed out of the 68040's caches
+// (and, if it was dirty, written back) since the core last read it
+reg         fl_req;           // one clock
+reg  [31:4] fl_addr;
+reg         fl_wait;          // asked, fl_done not yet seen
+wire        fl_done, fl_dirty;
+wire [127:0] fl_line;
+wire        fill_stb;
+wire [31:4] fill_line;
+wire        sb_pending;
+reg         fl_ok;            // fl_addr is flushed and written back
+reg         wb_pend;          // fl_line is being written to RAM
+reg   [1:0] wb_k;
+reg [127:0] wb_line;
+
 next_ap68040 #(.FPU_REVISION(8'h41)) cpu (
 	.clk(clk),
 	.nreset(nreset),
@@ -323,6 +339,15 @@ next_ap68040 #(.FPU_REVISION(8'h41)) cpu (
 	.snoop_stb(snoop_stb),               // DMA write: drop the D-cache line
 	.snoop_addr({snoop_line, 2'b00}),
 	.snoop_full(snoop_full),
+
+	.fl_req(fl_req),
+	.fl_addr(fl_addr),
+	.fl_done(fl_done),
+	.fl_dirty(fl_dirty),
+	.fl_line(fl_line),
+	.fill_stb(fill_stb),
+	.fill_line(fill_line),
+	.sb_pending(sb_pending),
 
 	.nresetout(),
 	.cacr_out(),
@@ -779,6 +804,8 @@ reg  [2:0] svc;
 reg        svc_walker;
 reg        svc_bus_direct;
 reg        svc_dma;           // the beat in S_MEM is tc_tdma's
+reg        svc_wb;            // the beat in S_MEM writes back a flushed line
+reg        fl_stale;          // the core read fl_addr's line since it was asked for
 reg [31:2] svc_addr;
 
 // The PC chip's DMA is the machine's other bus master (quadra800.sv's SONIC
@@ -807,7 +834,7 @@ wire [31:0] line_cpu_data = (b_addr[3:2] == 2'd0) ? mem_line_data[127:96] :
                             (b_addr[3:2] == 2'd2) ? mem_line_data[63:32]  :
                                                     mem_line_data[31:0];
 
-wire bus_ram_eligible = (svc == S_IDLE) && !walker_pend && !cpu_berr &&
+wire bus_ram_eligible = (svc == S_IDLE) && !walker_pend && !cpu_berr && !wb_pend &&
                         !bus_miss_ack && !bus_line_ack && !bus_adapter_active &&
                         !bus_ack_adapter && bus_req && !bus_write &&
                         (bus_size == 2'd2) && (bus_addr[1:0] == 2'b00) &&
@@ -839,7 +866,7 @@ wire        bus_wr_span  = (bus_wr_end > 3'd4);
 // decode and translation).  The rare store on the block's last longword
 // goes through the adapter like any other access.
 wire        bus_wr_nx_ok = ~&bus_addr[22:2];
-wire bus_wr_direct = (DIRECT_WRITES != 0) && (svc == S_IDLE) && !walker_pend && !cpu_berr &&
+wire bus_wr_direct = (DIRECT_WRITES != 0) && (svc == S_IDLE) && !walker_pend && !cpu_berr && !wb_pend &&
                      !bus_miss_ack && !bus_line_ack && !bus_adapter_active && !wr_split_pend &&
                      !bus_ack_adapter && bus_req && bus_write &&
                      (!bus_wr_span || bus_wr_nx_ok) &&
@@ -862,9 +889,15 @@ always @(posedge clk) begin
 	end
 end
 
-wire cpu_want = walker_pend || bus_first_miss || bus_wr_direct ||
-                (b_req && !b_ack && !cpu_berr && !line_cpu_wait);
-wire dma_take = dm_req && !dm_ack && !dm_err && !walker_pend && !snoop_full && (dma_turn || !cpu_want);
+wire cpu_want = !wb_pend && (walker_pend || bus_first_miss || bus_wr_direct ||
+                (b_req && !b_ack && !cpu_berr && !line_cpu_wait));
+// a DMA beat of RAM waits for its line's flush
+wire dm_line_ok = fl_ok && (fl_addr == dm_addr[31:4]);
+// (and for the store buffer: a line the core pushed may still be in it)
+wire dm_flushed = !ram_present(dm_addr) || (dm_line_ok && !wb_pend && !sb_pending);
+wire dma_take = dm_req && !dm_ack && !dm_err && !walker_pend && !snoop_full && !wb_pend && dm_flushed &&
+                (dma_turn || !cpu_want);
+wire fill_hit = fill_stb && (fill_line == fl_addr);
 
 assign dbg_berr      = (svc == S_BERR);
 assign dbg_berr_addr = {svc_addr, 2'b00};
@@ -875,7 +908,16 @@ always @(posedge clk) begin
 		svc_walker     <= 0;
 		svc_bus_direct <= 0;
 		svc_dma        <= 0;
+		svc_wb         <= 0;
 		svc_addr       <= 0;
+		fl_req         <= 0;
+		fl_addr        <= 0;
+		fl_wait        <= 0;
+		fl_ok          <= 0;
+		fl_stale       <= 0;
+		wb_pend        <= 0;
+		wb_k           <= 0;
+		wb_line        <= 0;
 		dma_turn       <= 0;
 		dm_ack         <= 0;
 		dm_err         <= 0;
@@ -924,6 +966,30 @@ always @(posedge clk) begin
 		dm_ack       <= 0;
 		dm_err       <= 0;
 		snoop_stb    <= 0;
+		fl_req       <= 0;
+		// DMA line flush: ask for the line of the waiting DMA beat; a core
+		// line read of it afterwards makes it stale again
+		if (fill_hit) begin
+			fl_ok    <= 0;
+			fl_stale <= 1;
+		end
+		if (fl_done) begin
+			fl_wait <= 0;
+			if (fl_dirty) begin
+				wb_pend <= 1;
+				wb_k    <= 0;
+				wb_line <= fl_line;
+			end
+			else fl_ok <= !fl_stale && !fill_hit;
+		end
+		else if (!fl_wait && !wb_pend && dm_req && !dm_ack && !dm_err &&
+		         ram_present(dm_addr) && !dm_line_ok) begin
+			fl_req   <= 1;
+			fl_wait  <= 1;
+			fl_addr  <= dm_addr[31:4];
+			fl_ok    <= 0;
+			fl_stale <= 0;
+		end
 		if (wr_split_pend) begin
 			wr_split_pend  <= 0;
 			mem_wp_valid   <= 1;
@@ -937,9 +1003,23 @@ always @(posedge clk) begin
 
 		case (svc)
 		S_IDLE: begin
-			// walker first (it only runs mid-translation); a DMA beat takes
-			// the turn after each CPU beat, or an idle bus
-			if (dma_take) begin
+			// a flushed dirty line goes to RAM first; then the walker (it only
+			// runs mid-translation); a DMA beat takes the turn after each CPU
+			// beat, or an idle bus
+			if (wb_pend) begin
+				svc_wb     <= 1;
+				svc_dma    <= 0;
+				svc_walker <= 0;
+				svc_bus_direct <= 0;
+				mem_req    <= 1;
+				mem_write  <= 1;
+				mem_addr   <= ram_sdram({fl_addr, wb_k});
+				mem_be     <= 4'b1111;
+				mem_wdata  <= wb_line[127 - 32 * wb_k -: 32];
+				mem_memsel <= MSEL_RAM;
+				svc        <= S_MEM;
+			end
+			else if (dma_take) begin
 				svc_walker     <= 0;
 				svc_bus_direct <= 0;
 				dma_turn       <= 0;
@@ -1066,7 +1146,15 @@ always @(posedge clk) begin
 		end
 		S_MEM: if (mem_ack) begin
 			mem_req <= 0;
-			if (svc_dma) begin
+			if (svc_wb) begin
+				svc_wb <= 0;
+				wb_k   <= wb_k + 2'd1;
+				if (wb_k == 2'd3) begin
+					wb_pend <= 0;
+					fl_ok   <= !fl_stale && !fill_hit;
+				end
+			end
+			else if (svc_dma) begin
 				dm_ack    <= 1;
 				dm_rdata  <= mem_rdata;
 				snoop_stb <= mem_write;

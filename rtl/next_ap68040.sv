@@ -38,6 +38,20 @@
 //  table 4-4).  TA is given once the snooper negates MI.  snoop_full asks
 //  tc_machine to hold DMA beats while the queue cannot take another line.
 //
+//  DMA coherency (SNOOP = 2, the default).  With the data cache in copyback
+//  a DMA read must see a dirty line and a DMA write must not be undone by
+//  one (SC = 10 writes invalidate a dirty line: its other bytes are lost).
+//  So before tc_machine serves a DMA beat of a RAM line it asks for that
+//  line to be flushed (fl_req, one clock): the core gives the bus up and
+//  the line is presented as an alternate master's line read with SC = 10
+//  (MC68040UM table 4-4: a dirty hit is supplied by the 68040 -- MI stays
+//  asserted, the core drives TA and the four long words -- then
+//  invalidated; a clean hit is invalidated; memory answers otherwise).
+//  fl_done reports the line, fl_dirty whether it was supplied (tc_machine
+//  writes it to RAM before the beat).  fill_stb/fill_line report every
+//  line read the core starts, so tc_machine knows when a flushed line may
+//  be cached again.
+//
 //  SNOOP = 0 leaves the snoop queue empty (DMA coherency is then the
 //  drivers').  It was tc_machine's setting until the AP68040 fix for a load
 //  answered with a discarded slow-path job's data during a snoop freeze
@@ -56,7 +70,7 @@ module next_ap68040
 	parameter        FPU_PIPE     = 0,             // AP68040 area options
 	parameter        LOOP_PRED    = 0,
 	parameter        EARLY_RES    = 0,
-	parameter        SNOOP        = 1,             // present DMA writes to the 68040's snooper
+	parameter        SNOOP        = 2,             // 1: snoop DMA writes after the fact; 2: flush lines before DMA
 	parameter [7:0]  NOCACHE_PAGE = 8'h02,         // physical [31:24] read with TCI
 	parameter [31:0] POST_LO      = 32'h0400_0000, // posted stores [POST_LO, POST_HI):
 	parameter [31:0] POST_HI      = 32'h0D00_0000  //   NeXT RAM + VRAM
@@ -84,6 +98,16 @@ module next_ap68040
 	input  [31:0] snoop_addr,
 	output        snoop_full,
 
+	// DMA line flush (SNOOP = 2)
+	input         fl_req,         // one clock: flush line fl_addr
+	input  [31:4] fl_addr,
+	output reg    fl_done,        // one clock: the flush of fl_addr is over
+	output reg    fl_dirty,       //   ... and the 68040 supplied fl_line
+	output reg [127:0] fl_line,
+	output reg    fill_stb,       // one clock: the core starts a line read
+	output reg [31:4] fill_line,
+	output        sb_pending,     // posted stores (a pushed line among them) not yet in memory
+
 	output        nresetout,
 	output [31:0] cacr_out,
 	output [31:0] vbr_out,
@@ -105,6 +129,7 @@ wire  [1:0] siz, tt;
 wire  [2:0] tm;
 wire        bb_n_o, bb_oe;
 wire        dbg_retire, dbg_halted, cmaint;
+wire        sn_ta_n, sn_ta_oe;
 
 reg  [31:0] d_i;
 reg         ta_n, tea_n, tci_n, avec_n;
@@ -114,18 +139,21 @@ reg         bg_n;
 reg  [31:0] alt_a;
 reg         alt_ts_n;
 reg         alt_ta_n;
+reg         alt_rd;
+reg         alt_ln;
 
 ap68040 #(
 	.FPU_REVISION(FPU_REVISION),
 	.FPU_PIPE(FPU_PIPE), .LOOP_PRED(LOOP_PRED), .EARLY_RES(EARLY_RES),
-	// DMA reads are not snooped: memory must stay current (hardware boot
-	// loops 2026-10-19: copyback 3/4, write-through 6/6)
-	.DC_WRITETHROUGH(1)
+	// copyback: the core's write-through stores run through the DMU
+	// engine one at a time (~2.9x Dhrystone).  DMA reads are not snooped
+	// (hardware boot loops 2026-10-19: copyback 3/4, write-through 6/6)
+	.DC_WRITETHROUGH(0)
 ) cpu (
 	.clk(clk), .bclk_en(1'b1), .rsti_n(nreset),
 	.a_o(a_o), .a_oe(),
-	.a_i(alt_a), .ts_n_i(alt_ts_n), .rw_n_i(1'b0), .siz_i(SIZ_L), .tt_i(2'b00),
-	.sc(2'b10), .mi_n(mi_n), .ta_n_o(), .ta_oe(),
+	.a_i(alt_a), .ts_n_i(alt_ts_n), .rw_n_i(alt_rd), .siz_i(alt_ln ? SIZ_LINE : SIZ_L), .tt_i(2'b00),
+	.sc(2'b10), .mi_n(mi_n), .ta_n_o(sn_ta_n), .ta_oe(sn_ta_oe),
 	.d_i(d_i), .d_o(d_o), .d_oe(d_oe),
 	.rw_n(rw_n), .siz(siz), .tt(tt), .tm(tm), .tln(), .upa(),
 	.ciout_n(ciout_n), .lock_n(), .locke_n(),
@@ -207,12 +235,16 @@ always @(posedge clk) begin
 		xfc    <= 3'd0;
 		beat   <= 2'd0;
 		xlast  <= 1'b0;
+		fill_stb  <= 1'b0;
+		fill_line <= 0;
 	end
 	else begin
 		ta_n   <= 1'b1;
 		tea_n  <= 1'b1;
 		tci_n  <= 1'b1;
 		avec_n <= 1'b1;
+		fill_stb  <= cst == C_IDLE && !ts_n && rw_n && siz == SIZ_LINE && tt != 2'd3;
+		fill_line <= a_o[31:4];
 		case (cst)
 			C_IDLE:
 				if (!ts_n) begin
@@ -297,7 +329,7 @@ wombat_store_buffer #(.ENABLE(1), .POST_LO(POST_LO), .POST_HI(POST_HI)) store_bu
 	.m_ack(bus_ack),
 	.m_rdata(bus_rdata),
 	.m_err(berr),
-	.pending()
+	.pending(sb_pending)
 );
 
 //----------------------------------------------------------------------------
@@ -311,13 +343,17 @@ reg   [3:0] q_n;
 reg  [31:4] q_last;            // the line queued last (coalescing)
 reg         q_last_v;
 
-localparam [2:0] N_IDLE = 3'd0, N_REL = 3'd1, N_TS = 3'd2, N_MI = 3'd3,
-                 N_TA = 3'd4, N_GAP = 3'd5;
-reg   [2:0] nst;
+localparam [3:0] N_IDLE = 4'd0, N_REL = 4'd1, N_TS = 4'd2, N_MI = 4'd3,
+                 N_TA = 4'd4, N_GAP = 4'd5, N_FTS = 4'd6, N_FLK = 4'd7,
+                 N_FMEM = 4'd8, N_FSRC = 4'd9, N_FEND = 4'd10;
+reg   [3:0] nst;
+reg         fl_pend;           // a flush is asked for and not yet presented
+reg  [31:4] fl_a;
+reg   [1:0] fk;                // TAs given / long words taken
 
 wire        q_pop  = (nst == N_TS);
 wire        q_dup  = q_last_v && (q_last == snoop_addr[31:4]);
-wire        q_push = (SNOOP != 0) && snoop_stb && !q_dup;
+wire        q_push = (SNOOP == 1) && snoop_stb && !q_dup;
 assign snoop_full = (q_n >= QD - 1);
 
 always @(posedge clk) begin
@@ -351,25 +387,83 @@ always @(posedge clk) begin
 		alt_ts_n <= 1'b1;
 		alt_ta_n <= 1'b1;
 		alt_a    <= 32'd0;
+		alt_rd   <= 1'b0;
+		alt_ln   <= 1'b0;
+		fl_pend  <= 1'b0;
+		fl_a     <= 0;
+		fk       <= 2'd0;
+		fl_done  <= 1'b0;
+		fl_dirty <= 1'b0;
+		fl_line  <= 128'd0;
 	end
 	else begin
 		alt_ts_n <= 1'b1;
 		alt_ta_n <= 1'b1;
+		fl_done  <= 1'b0;
+		if (fl_req) begin
+			fl_pend <= 1'b1;
+			fl_a    <= fl_addr;
+		end
 		case (nst)
 			N_IDLE:
-				if (q_n != 0) begin
+				if (q_n != 0 || fl_pend) begin
 					bg_n <= 1'b1;       // the core finishes its transfer, then lets go
 					nst  <= N_REL;
 				end
 			N_REL:
 				// BG has been negated for a clock: BB free means the core is
 				// not the master and cannot become it
-				if (bb_n_o && tip_n && cst == C_IDLE && ts_n) nst <= N_TS;
+				if (bb_n_o && tip_n && cst == C_IDLE && ts_n) nst <= fl_pend ? N_FTS : N_TS;
 			N_TS: begin
 				alt_a    <= {q_line[q_rp], 4'h0};
+				alt_rd   <= 1'b0;
+				alt_ln   <= 1'b0;
 				alt_ts_n <= 1'b0;
 				nst      <= N_MI;
 			end
+			// the flush: a line read, SC = 10
+			N_FTS: begin
+				alt_a    <= {fl_a, 4'h0};
+				alt_rd   <= 1'b1;
+				alt_ln   <= 1'b1;
+				alt_ts_n <= 1'b0;
+				fl_pend  <= 1'b0;      // one flush at a time (tc_machine waits for fl_done)
+				fl_dirty <= 1'b0;
+				fk       <= 2'd0;
+				nst      <= N_FLK;
+			end
+			N_FLK:
+				if (sn_ta_oe && !sn_ta_n) begin
+					// intervention: the first long word (A3-A2 = 0, in order)
+					fl_line[127:96] <= d_o;
+					fl_dirty        <= 1'b1;
+					fk              <= 2'd1;
+					nst             <= N_FSRC;
+				end
+				else if (alt_ts_n && mi_n) begin
+					// MI negated: memory answers, four TAs (the data is ours to
+					// ignore -- this master reads nothing)
+					alt_ta_n <= 1'b0;
+					fk       <= 2'd1;
+					nst      <= N_FMEM;
+				end
+			N_FMEM: begin
+				alt_ta_n <= 1'b0;
+				fk       <= fk + 2'd1;
+				if (fk == 2'd3) nst <= N_FEND;
+			end
+			N_FSRC:
+				if (sn_ta_oe && !sn_ta_n) begin
+					fl_line[127 - 32 * fk -: 32] <= d_o;
+					fk <= fk + 2'd1;
+					if (fk == 2'd3) nst <= N_FEND;
+				end
+			N_FEND:
+				// the snooper has released TA (S_END) or seen the last TA
+				if (!sn_ta_oe && alt_ta_n) begin
+					fl_done <= 1'b1;
+					nst     <= N_GAP;
+				end
 			N_MI:
 				// the snooper has looked: MI negated, memory may answer
 				if (alt_ts_n && mi_n) begin
@@ -379,7 +473,8 @@ always @(posedge clk) begin
 			N_TA:
 				nst <= N_GAP;
 			N_GAP:
-				if (q_n != 0) nst <= N_TS;
+				if (fl_pend) nst <= N_FTS;
+				else if (q_n != 0) nst <= N_TS;
 				else begin
 					bg_n <= 1'b0;
 					nst  <= N_IDLE;
@@ -569,5 +664,57 @@ always @(posedge clk)
 assign debug_fault   = flt_seen;
 assign debug_status  = {24'd0, 5'd0, cst, 192'd0, dbg_pc};
 assign debug_status2 = {64'd0, xa, 30'd0, cmaint, dbg_retire};
+
+`ifdef NEXT_A040_PERF
+// sim-only: clocks from TS to the transfer's last TA/TEA, by kind and region
+// kind: 0 line read code, 1 line read data, 2 single read, 3 line write,
+//       4 single write
+// region: 0 ROM $00/$01, 1 device $02, 2 RAM $04-$07, 3 VRAM $0B/$0C, 4 other
+reg [63:0] pf_cyc = 0, pf_busy = 0, pf_ret = 0, pf_fl = 0, pf_fld = 0, pf_flc = 0;
+reg [63:0] pf_n [0:24];
+reg [63:0] pf_t [0:24];
+reg [15:0] pf_max [0:24];
+reg [15:0] pf_cur = 0;
+reg  [4:0] pf_k = 0;
+initial for (int i = 0; i < 25; i++) begin pf_n[i] = 0; pf_t[i] = 0; pf_max[i] = 0; end
+function [2:0] pf_reg(input [7:0] p);
+	pf_reg = (p <= 8'h01) ? 3'd0 : (p == 8'h02) ? 3'd1 :
+	         (p >= 8'h04 && p <= 8'h07) ? 3'd2 : (p == 8'h0B || p == 8'h0C) ? 3'd3 : 3'd4;
+endfunction
+task pf_dump;
+	static string kn [0:4] = '{"lineR code", "lineR data", "read      ", "lineW     ", "write     "};
+	static string rn [0:4] = '{"ROM", "dev", "RAM", "VRAM", "oth"};
+	$display("[PERF] cyc=%0d busy=%0d (%0d%%) retired=%0d flushes=%0d dirty=%0d flush_clk=%0d", pf_cyc, pf_busy,
+	         pf_cyc ? pf_busy * 100 / pf_cyc : 0, pf_ret, pf_fl, pf_fld, pf_flc);
+	for (int k = 0; k < 5; k++) for (int r = 0; r < 5; r++)
+		if (pf_n[k*5+r] != 0)
+			$display("[PERF] %s %-4s n=%0d avg=%0d.%02d max=%0d tot=%0d", kn[k], rn[r], pf_n[k*5+r],
+			         pf_t[k*5+r] / pf_n[k*5+r], (pf_t[k*5+r] * 100 / pf_n[k*5+r]) % 100,
+			         pf_max[k*5+r], pf_t[k*5+r]);
+endtask
+always @(posedge clk) if (nreset) begin
+	pf_cyc <= pf_cyc + 1;
+	if (dbg_retire) pf_ret <= pf_ret + 1;
+	if (fl_done) begin pf_fl <= pf_fl + 1; if (fl_dirty) pf_fld <= pf_fld + 1; end
+	if (nst >= N_FTS || (nst == N_REL && fl_pend)) pf_flc <= pf_flc + 1;
+	if (cst != C_IDLE) pf_busy <= pf_busy + 1;
+	if (cst == C_IDLE && !ts_n && tt != 2'd3) begin
+		pf_cur <= 1;
+		pf_k   <= ((siz == SIZ_LINE) ? (rw_n ? (((tt != 2'd2) && (tm == 3'd2 || tm == 3'd6)) ? 5'd0 : 5'd5) : 5'd15)
+		                             : (rw_n ? 5'd10 : 5'd20)) + pf_reg(a_o[31:24]);
+	end
+	else if (pf_cur != 0) begin
+		if (cst == C_TA && xlast) begin
+			pf_n[pf_k] <= pf_n[pf_k] + 1;
+			pf_t[pf_k] <= pf_t[pf_k] + pf_cur + 1;
+			if (pf_cur + 1 > pf_max[pf_k]) pf_max[pf_k] <= pf_cur + 1;
+			pf_cur <= 0;
+		end
+		else pf_cur <= pf_cur + 1;
+	end
+	if (pf_cyc % 64'd10000000 == 0 && pf_cyc != 0) pf_dump();
+end
+final pf_dump();
+`endif
 
 endmodule
