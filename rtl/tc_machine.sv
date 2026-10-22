@@ -609,11 +609,11 @@ tc_enet enet (
 	.guest_mac(enet_mac)
 );
 
-// DSP56001 host port (Previous ioMemTabTurbo.c:130-137): rtl/tc_dsp.sv, the
-// 68040's side; the DSP runs on the ARM (Main_MiSTer support/next/next_dsp.cpp)
-// behind a DDR3 mailbox at $30400000.  NEXT_NO_DSP (qsf) leaves it out: the
-// registers read 0 as before the DSP work, and the Music Kit's DSP use is
-// parked (docs/DECISIONS.md "Sound and DSP").
+// DSP56001 (Previous ioMemTabTurbo.c:130-137): rtl/tc_dsp56k.sv, the DSP in
+// the FPGA (rtl/dsp56k, from Falcon_MiSTer) behind the 68040's host port.
+// NEXT_DSP_ARM (qsf) selects rtl/tc_dsp.sv instead, the host port with the
+// DSP on the ARM (Main_MiSTer support/next/next_dsp.cpp) behind a DDR3
+// mailbox at $30400000.  NEXT_NO_DSP leaves the DSP out: its registers read 0.
 wire [31:0] dsp_rdata;  wire dsp_ack;
 wire        ds_m_req, ds_m_we;
 wire [28:0] ds_m_addr;
@@ -625,7 +625,7 @@ assign int_dsp = 1'b0;
 assign dd_req = 1'b0;  assign dd_we = 1'b0;  assign dd_wdata = 8'd0;
 assign ds_m_req = 1'b0;  assign ds_m_we = 1'b0;
 assign ds_m_addr = 29'd0;  assign ds_m_wdata = 64'd0;
-`else
+`elsif NEXT_DSP_ARM
 tc_dsp #(.CLK_HZ(CLK_HZ)) dsp (
 	.clk(clk), .reset(dev_rst),
 	.stb(io_stb && io_dev == D_DSP && !io_tmc), .we(io_we),
@@ -637,6 +637,18 @@ tc_dsp #(.CLK_HZ(CLK_HZ)) dsp (
 	.m_req(ds_m_req), .m_we(ds_m_we), .m_addr(ds_m_addr), .m_wdata(ds_m_wdata),
 	.m_rdata(enet_m_rdata), .m_ack(ds_m_ack)
 );
+`else
+tc_dsp56k #(.CLK_HZ(CLK_HZ)) dsp (
+	.clk(clk), .reset(dev_rst),
+	.stb(io_stb && io_dev == D_DSP && !io_tmc), .we(io_we),
+	.addr2(io_addr[2]), .be(io_be), .wdata(io_wdata),
+	.rdata(dsp_rdata), .ack(dsp_ack),
+	.scr2(scr2), .int_dsp(int_dsp),
+	.dd_req(dd_req), .dd_we(dd_we), .dd_wdata(dd_wdata), .dd_ack(dd_ack),
+	.dd_rdata(dd_rdata), .dd_avail(dd_avail), .dd_blkend(dd_blkend)
+);
+assign ds_m_req = 1'b0;  assign ds_m_we = 1'b0;
+assign ds_m_addr = 29'd0;  assign ds_m_wdata = 64'd0;
 `endif
 
 // The DDR3 mailbox port (tc_enet_ddr in the top) serves the Ethernet bridge

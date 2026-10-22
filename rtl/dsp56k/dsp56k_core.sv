@@ -49,6 +49,20 @@
 // interrupt pipeline model, AGU delay slot, register read side effects,
 // flags), is reproduced exactly and checked by the differential testbench.
 
+// NeXT-Color changes (NeXT-Color_MiSTer, rtl/dsp56k; Previous r1851
+// src/dsp/dsp_cpu.c read_memory / write_memory_raw, dsp_core.c
+// dsp_core_start, dsp.c DSP_SetIRQB):
+//   - External RAM is the Turbo's 8K words (DSP_RAMSIZE_24kB), present only
+//     while SCR2 DSP_MEM_EN is set (mem_en; reads 0, writes dropped when
+//     not).  P: ext[12:0].  X/Y with A15 = 0 alias P (ext[12:0]); with
+//     A15 = 1 Y is the lower half (ext[11:0]) and X the upper (ext[4096 |
+//     11:0]).  The Falcon map (32K words, X/Y split by space) is gone.
+//   - IRQB (vector P:$000A, level IPR[4:3]): a pulse on irqb latches it;
+//     taking it clears it (Previous auto-releases IRQB for the NeXT).  It
+//     ranks above the host interface at the same level.
+//   - start_direct: run_start without the host bootstrap starts in OMR mode
+//     start_mode at P:$0000 (mode 0) or P:$E000 (mode 2) (dsp_core_start).
+
 module dsp56k_core (
     input             clk,
     input             rst,            // synchronous DSP reset (dsp_core_reset)
@@ -62,6 +76,10 @@ module dsp56k_core (
     input             boot_we,
     input       [8:0] boot_addr,
     input      [23:0] boot_data,
+    input             start_direct,   // run_start without the bootstrap (NeXT mode 0 / 2)
+    input       [1:0] start_mode,
+    input             mem_en,         // external RAM present (NeXT SCR2 DSP_MEM_EN)
+    input             irqb,           // IRQB request, one clock (NeXT DMA block end)
 
     // X peripheral port (X:$FFC0-$FFFF) and Y peripheral port (Y:$FFC0-$FFFF)
     // read data valid on the clock after the strobe (like the RAMs)
@@ -148,6 +166,7 @@ module dsp56k_core (
     reg [15:0] agu_val /*verilator public_flat_rw*/;
     reg        st_trace /*verilator public_flat_rw*/, st_swi /*verilator public_flat_rw*/;
     reg        st_illegal /*verilator public_flat_rw*/, st_stkerr /*verilator public_flat_rw*/;
+    reg        st_irqb /*verilator public_flat_rw*/;   // IRQB pending (NeXT)
 
     // sequencer
     reg  [2:0] state /*verilator public_flat_rw*/;
@@ -175,13 +194,18 @@ module dsp56k_core (
         .we_b(pint_we_b), .addr_b(pint_addr_b), .d_b(pint_d_b), .q_b(pint_q_b));
 
     reg         ext_we_a, ext_we_b;
-    reg  [14:0] ext_addr_a, ext_addr_b;
+    reg  [12:0] ext_addr_a, ext_addr_b;
     reg  [23:0] ext_d_a, ext_d_b;
     wire [23:0] ext_q_a, ext_q_b;
-    dsp_ram_tdp #(.AW(15), .DW(24)) u_ext (
+    dsp_ram_tdp #(.AW(13), .DW(24)) u_ext (
         .clk(clk),
-        .we_a(ext_we_a), .addr_a(ext_addr_a), .d_a(ext_d_a), .q_a(ext_q_a),
-        .we_b(ext_we_b), .addr_b(ext_addr_b), .d_b(ext_d_b), .q_b(ext_q_b));
+        .we_a(ext_we_a && mem_en), .addr_a(ext_addr_a), .d_a(ext_d_a), .q_a(ext_q_a),
+        .we_b(ext_we_b && mem_en), .addr_b(ext_addr_b), .d_b(ext_d_b), .q_b(ext_q_b));
+    // no external RAM (DSP_MEM_EN 0): reads 0 (Previous dsp_core.ramext NULL)
+    reg         mem_en_q;
+    always @(posedge clk) mem_en_q <= mem_en;
+    wire [23:0] ext_qa = mem_en_q ? ext_q_a : 24'd0;
+    wire [23:0] ext_qb = mem_en_q ? ext_q_b : 24'd0;
 
     reg         xint_we, yint_we;
     reg  [7:0]  xint_addr, yint_addr;
@@ -204,8 +228,8 @@ module dsp56k_core (
     // ------------------------------------------------------------------
     wire        e1 = (state == ST_EXEC) && (cyc == 7'd0);
     wire        el = (state == ST_EXEC) && (cyc == ncyc - 7'd1);
-    wire [23:0] ir1 = fa_ext ? ext_q_a : pint_q_a;     // fetched opcode (E1 only)
-    wire [23:0] ew1 = fb_ext ? ext_q_b : pint_q_b;     // fetched next word (E1 only)
+    wire [23:0] ir1 = fa_ext ? ext_qa : pint_q_a;     // fetched opcode (E1 only)
+    wire [23:0] ew1 = fb_ext ? ext_qb : pint_q_b;     // fetched next word (E1 only)
 
     // E1 decoder (fetched opcode)
     wire [6:0] d1_cls;  wire [3:0] d1_pk;  wire d1_ispm, d1_alu_und;
@@ -589,12 +613,10 @@ module dsp56k_core (
         if (spc == 2'd2) region = (ad[15:9] == 7'h00) ? RG_PINT : RG_EXT;
         else region = xy_region(ad, we, dev);
     endfunction
-    function automatic [14:0] ext_addr(input [1:0] spc, input [15:0] ad);
-        case (spc)
-            2'd0: ext_addr = {1'b1, ad[13:0]};
-            2'd1: ext_addr = {1'b0, ad[13:0]};
-            default: ext_addr = ad[14:0];
-        endcase
+    // NeXT: 8K words; X/Y alias P unless A15, then Y low half, X high half
+    function automatic [12:0] ext_addr(input [1:0] spc, input [15:0] ad);
+        if (spc != 2'd2 && ad[15]) ext_addr = {spc == 2'd0, ad[11:0]};
+        else ext_addr = ad[12:0];
     endfunction
 
     // full addresses (registered for a delayed issue, cycle count) and the
@@ -724,14 +746,14 @@ module dsp56k_core (
             RG_ROM:  rd1_c = (a1_sp_q == 2'd1) ? yrom_q : xrom_q;
             RG_PER:  rd1_c = (a1_sp_q == 2'd1) ? pery_rdata : perx_rdata;
             RG_PINT: rd1_c = pint_q_a;
-            RG_EXT:  rd1_c = (a1_sp_q == 2'd1) ? ext_q_b : ext_q_a;
+            RG_EXT:  rd1_c = (a1_sp_q == 2'd1) ? ext_qb : ext_qa;
             default: rd1_c = 24'd0;
         endcase
         case (r2_q)
             RG_INT:  rd2_c = yint_q;
             RG_ROM:  rd2_c = yrom_q;
             RG_PER:  rd2_c = pery_rdata;
-            RG_EXT:  rd2_c = ext_q_b;
+            RG_EXT:  rd2_c = ext_qb;
             default: rd2_c = 24'd0;
         endcase
     end
@@ -896,6 +918,7 @@ module dsp56k_core (
     reg [15:0] n_agu_val;
     reg        n_st_trace, n_st_swi, n_st_illegal, n_st_stkerr;
     reg        n_hc_ack, n_wait, n_stop;
+    reg        n_irqb_take;
     // stack entry writes of this instruction, applied in the order a, b, c
     reg        wa_h, wa_l, wb_h, wc_h;
     reg  [3:0] wa_i, wb_i, wc_i;
@@ -933,7 +956,7 @@ module dsp56k_core (
         reg  [5:0] nr;
         reg  [4:0] vec;
         reg  [1:0] ipl, lvl;
-        reg        hst_on, ssi_on, p_hc, p_hr, p_ht, p_sr, p_st;
+        reg        hst_on, ssi_on, irqb_on, p_hc, p_hr, p_ht, p_sr, p_st;
         reg  [3:0] ki;
 
         n_x0 = x0; n_x1 = x1; n_y0 = y0; n_y1 = y1;
@@ -944,7 +967,7 @@ module dsp56k_core (
         n_int_state = int_state; n_int_cnt = int_cnt; n_int_fetch = int_fetch;
         n_int_save_pc = int_save_pc; n_int_ipl = int_ipl;
         n_st_trace = st_trace; n_st_swi = st_swi; n_st_illegal = st_illegal; n_st_stkerr = st_stkerr;
-        n_hc_ack = 1'b0; n_wait = 1'b0; n_stop = 1'b0;
+        n_hc_ack = 1'b0; n_wait = 1'b0; n_stop = 1'b0; n_irqb_take = 1'b0;
         n_agu_reg = 6'd0; n_agu_val = agu_val;
         wa_h = 1'b0; wa_l = 1'b0; wb_h = 1'b0; wc_h = 1'b0;
         wa_i = 4'd0; wb_i = 4'd0; wc_i = 4'd0;
@@ -956,7 +979,7 @@ module dsp56k_core (
         bv = 32'd0; bm = 32'd0; rdv = 32'd0; v24 = 24'd0; xy0 = 24'd0;
         d56 = 56'd0; s56 = 56'd0; r56 = 56'd0;
         nr = 6'd0; vec = 5'd0; ipl = 2'd0; lvl = 2'd0;
-        hst_on = 1'b0; ssi_on = 1'b0; p_hc = 1'b0; p_hr = 1'b0; p_ht = 1'b0; p_sr = 1'b0; p_st = 1'b0;
+        hst_on = 1'b0; ssi_on = 1'b0; irqb_on = 1'b0; p_hc = 1'b0; p_hr = 1'b0; p_ht = 1'b0; p_sr = 1'b0; p_st = 1'b0;
         ki = 4'd0;
         len = (dq_ea_m6 || dq_do) ? 16'd2 : 16'd1;
         n_pc = pc; n_pc1 = pc_p1;
@@ -1414,22 +1437,28 @@ module dsp56k_core (
                     p_st = int_ssi_trx & msk_ssi_trx;
                     hst_on = (ipr[11:10] != 2'd0) && (p_hc | p_hr | p_ht);
                     ssi_on = (ipr[13:12] != 2'd0) && (p_sr | p_st);
+                    irqb_on = (ipr[4:3] != 2'd0) && st_irqb;
                     // highest level first, down to the SR interrupt mask
                     if (n_sr[9:8] <= 2'd2) begin
-                        if (hst_on && ipr[11:10] == 2'd3) begin found = 1'b1; lvl = 2'd2; end
+                        if (irqb_on && ipr[4:3] == 2'd3) begin found = 1'b1; lvl = 2'd2; end
+                        else if (hst_on && ipr[11:10] == 2'd3) begin found = 1'b1; lvl = 2'd2; end
                         else if (ssi_on && ipr[13:12] == 2'd3) begin found = 1'b1; lvl = 2'd2; end
                     end
                     if (!found && n_sr[9:8] <= 2'd1) begin
-                        if (hst_on && ipr[11:10] == 2'd2) begin found = 1'b1; lvl = 2'd1; end
+                        if (irqb_on && ipr[4:3] == 2'd2) begin found = 1'b1; lvl = 2'd1; end
+                        else if (hst_on && ipr[11:10] == 2'd2) begin found = 1'b1; lvl = 2'd1; end
                         else if (ssi_on && ipr[13:12] == 2'd2) begin found = 1'b1; lvl = 2'd1; end
                     end
                     if (!found && n_sr[9:8] == 2'd0) begin
-                        if (hst_on && ipr[11:10] == 2'd1) begin found = 1'b1; lvl = 2'd0; end
+                        if (irqb_on && ipr[4:3] == 2'd1) begin found = 1'b1; lvl = 2'd0; end
+                        else if (hst_on && ipr[11:10] == 2'd1) begin found = 1'b1; lvl = 2'd0; end
                         else if (ssi_on && ipr[13:12] == 2'd1) begin found = 1'b1; lvl = 2'd0; end
                     end
                     if (found) begin
                         ipl = lvl + 2'd1;
-                        if (hst_on && ipr[11:10] == lvl + 2'd1) begin
+                        if (irqb_on && ipr[4:3] == lvl + 2'd1) begin
+                            vec = 5'd5; n_irqb_take = 1'b1;     // IRQB, P:$000A
+                        end else if (hst_on && ipr[11:10] == lvl + 2'd1) begin
                             if (p_hc) begin vec = hc_vector; n_hc_ack = 1'b1; end
                             else if (p_hr) vec = 5'd16;
                             else vec = 5'd17;
@@ -1462,8 +1491,8 @@ module dsp56k_core (
     always @* begin
         pint_we_a = 1'b0; pint_addr_a = 9'd0; pint_d_a = 24'd0;
         pint_we_b = 1'b0; pint_addr_b = 9'd0; pint_d_b = 24'd0;
-        ext_we_a = 1'b0; ext_addr_a = 15'd0; ext_d_a = 24'd0;
-        ext_we_b = 1'b0; ext_addr_b = 15'd0; ext_d_b = 24'd0;
+        ext_we_a = 1'b0; ext_addr_a = 13'd0; ext_d_a = 24'd0;
+        ext_we_b = 1'b0; ext_addr_b = 13'd0; ext_d_b = 24'd0;
         xint_we = 1'b0; xint_addr = 8'd0; xint_d = 24'd0;
         yint_we = 1'b0; yint_addr = 8'd0; yint_d = 24'd0;
         xrom_en = 1'b0; xrom_addr = 8'd0; yrom_en = 1'b0; yrom_addr = 8'd0;
@@ -1472,9 +1501,9 @@ module dsp56k_core (
 
         if (fetch_now) begin
             pint_addr_a = fetch_pc[8:0];
-            ext_addr_a  = fetch_pc[14:0];
+            ext_addr_a  = fetch_pc[12:0];
             pint_addr_b = fetch_pc1[8:0];
-            ext_addr_b  = fetch_pc1[14:0];
+            ext_addr_b  = fetch_pc1[12:0];
         end else begin
             if (vec_rd) pint_addr_b = vec_ad[8:0];
             if (do1) begin
@@ -1524,6 +1553,7 @@ module dsp56k_core (
     wire h_pend = (int_host_cmd & msk_host_cmd) | (int_host_rcv & msk_host_rcv) | (int_host_trx & msk_host_trx);
     wire s_pend = (int_ssi_rcv & msk_ssi_rcv) | (int_ssi_trx & msk_ssi_trx);
     wire wait_release = st_illegal | st_stkerr | st_trace | st_swi |
+        (st_irqb && ipr[4:3] != 2'd0 && sr[9:8] < ipr[4:3]) |
         ((sr[9:8] <= 2'd2) && (((ipr[11:10] == 2'd3) && h_pend) || ((ipr[13:12] == 2'd3) && s_pend))) ||
         ((sr[9:8] <= 2'd1) && (((ipr[11:10] == 2'd2) && h_pend) || ((ipr[13:12] == 2'd2) && s_pend))) ||
         ((sr[9:8] == 2'd0) && (((ipr[11:10] == 2'd1) && h_pend) || ((ipr[13:12] == 2'd1) && s_pend)));
@@ -1545,6 +1575,7 @@ module dsp56k_core (
             int_ipl <= 2'd0;
             agu_reg <= 6'd0; agu_val <= 16'd0;
             st_trace <= 1'b0; st_swi <= 1'b0; st_illegal <= 1'b0; st_stkerr <= 1'b0;
+            st_irqb <= 1'b0;
             state <= ST_IDLE; cyc <= 7'd0; ncyc <= 7'd2;
             delay_q <= 1'b0; t_wr2 <= 1'b0; aw_en_q <= 1'b0;
             fa_ext <= 1'b0; fb_ext <= 1'b0;
@@ -1552,8 +1583,13 @@ module dsp56k_core (
             case (state)
                 ST_IDLE: begin
                     if (run_start) begin
-                        rr[0] <= {6'd0, boot_pos};
-                        omr <= 8'h02;
+                        if (start_direct) begin                 // dsp_core_start
+                            omr <= {6'd0, start_mode};
+                            pc  <= (start_mode == 2'd2) ? 16'he000 : 16'd0;
+                        end else begin
+                            rr[0] <= {6'd0, boot_pos};
+                            omr <= 8'h02;
+                        end
                     end
                     if (run) state <= ST_FETCH;
                 end
@@ -1623,6 +1659,7 @@ module dsp56k_core (
                         agu_reg <= n_agu_reg; agu_val <= n_agu_val;
                         st_trace <= n_st_trace; st_swi <= n_st_swi; st_illegal <= n_st_illegal;
                         st_stkerr <= n_st_stkerr;
+                        if (n_irqb_take) st_irqb <= 1'b0;
                         fa_ext <= n_pc[15:9] != 7'd0;
                         fb_ext <= fetch_pc1[15:9] != 7'd0;
                         cyc <= 7'd0;
@@ -1632,6 +1669,7 @@ module dsp56k_core (
                     end
                 end
             endcase
+            if (irqb) st_irqb <= 1'b1;              // a new request wins over the take
         end
     end
 endmodule
