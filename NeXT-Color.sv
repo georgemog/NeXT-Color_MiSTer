@@ -18,14 +18,15 @@
 //  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 //
 //  Clocks (structure from MacQuadra800_MiSTer, MacQuadra800.sv):
-//    clk_sys  28.500 MHz  the CPU bus, devices (the real Turbo bus is 33 MHz:
+//    clk_sys  25.000 MHz  the CPU bus, devices (the real Turbo bus is 33 MHz:
 //                         this one is set by clk_cpu, see below; CLK_HZ
 //                         keeps the devices' real-time rates)
-//    clk_ram  85.500 MHz  SDRAM controller, exactly 3 x clk_sys (same PLL)
-//    clk_cpu  57.000 MHz  the AP68040 core, 2 x clk_sys (same PLL; its bus
-//                         runs at clk_sys, rtl/next_ap68040.sv).  The core
-//                         closes at ~59 MHz in this design, not 66, so the
-//                         whole PLL sits 14% below the 33/99 MHz it had.
+//    clk_ram  75.000 MHz  SDRAM controller, exactly 3 x clk_sys (same PLL)
+//    clk_cpu  50.000 MHz  the AP68040 core, 2 x clk_sys (same PLL; its bus
+//                         runs at clk_sys, rtl/next_ap68040.sv).  With the
+//                         DSP56001 in the FPGA (~95% full) 57 MHz did not
+//                         close on six seeds, so the whole PLL sits 24%
+//                         below the 33/99 MHz it had.
 //    clk_vid 100.000 MHz  pixel clock, own PLL (rtl/pll_vid.v)
 //
 //  Memory (docs/DECISIONS.md):
@@ -183,7 +184,7 @@ assign LED_DISK = {1'b0, sd_busy | sd_ack_v[4]};
 
 ///////////////////////   CLOCKS   ///////////////////////////////
 
-localparam CLK_SYS_HZ = 28500000;   // rtl/pll/pll_0002.v outclk_0
+localparam CLK_SYS_HZ = 25000000;   // rtl/pll/pll_0002.v outclk_0
 
 wire clk_sys, clk_ram, clk_cpu, pll_locked;
 pll pll
