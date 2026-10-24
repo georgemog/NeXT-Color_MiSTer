@@ -88,6 +88,8 @@ module tc_machine
 	// peripherals
 	input      [10:0] ps2_key,
 	input      [24:0] ps2_mouse,
+	input             osd_power,          // OSD P1 buttons: one-cycle pulses
+	input             osd_nmi,
 	input      [32:0] timestamp,
 	input             pot_on,             // NVRAM default: power-on test
 	input      [95:0] boot_cmd,           // NVRAM default: boot command
@@ -514,6 +516,7 @@ tc_kms #(.CLK_HZ(CLK_HZ)) kms (
 	.stb(io_stb && io_dev == D_KMS && !io_tmc), .we(io_we), .addr(io_addr[3:2]), .be(io_be), .wdata(io_wdata),
 	.rdata(kms_rdata), .ack(kms_ack),
 	.ps2_key(ps2_key), .ps2_mouse(ps2_mouse),
+	.osd_power(osd_power), .osd_nmi(osd_nmi),
 	.int_keymouse(int_keymouse), .nmi(int_kms_nmi), .power_key(kms_power_key),
 	.reset_req(reset_req), .dbg_cmd(),
 	.so_req(so_req), .so_ack(so_ack), .so_rdata(so_rdata), .so_avail(so_avail),

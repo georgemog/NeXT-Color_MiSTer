@@ -186,6 +186,8 @@ tc_machine machine
 
 	.ps2_key(ps2_key),
 	.ps2_mouse(ps2_mouse),
+	.osd_power(1'b0),
+	.osd_nmi(1'b0),
 	.timestamp(timestamp),
 	.pot_on(pot_on),
 	.boot_cmd(boot_cmd),

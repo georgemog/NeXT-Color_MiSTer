@@ -104,11 +104,17 @@ localparam CONF_STR = {
 	// so Connected = mode 1.  rtl/tc_enet.sv: a twisted-pair link.
 	"O[52],Ethernet,Disconnected,Connected;",
 	"-;",
+	"P1,Machine;",
 	"P2,Video;",
 	"P5,Advanced;",
 	"-;",
 	"h0-,Changes pending;",
 	"R[0],Apply and reset;",
+
+	// buttons (status pulses while held): the NeXT power key (the
+	// power-off panel, as F10) and the NMI (the ROM monitor, as F11)
+	"P1T[10],Power key;",
+	"P1T[11],NMI (monitor);",
 
 	// V-Integer first (the default): 1:1 1120x832 on a 1080p display.
 	"P2O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
@@ -302,6 +308,12 @@ always @(posedge clk_sys) if (config_reset) begin
 	endcase
 end
 
+// The P1 Machine buttons: a press is a rising edge of the T bit.
+reg  [11:10] osd_btn_d = 2'b00;
+always @(posedge clk_sys) osd_btn_d <= status[11:10];
+wire osd_power = status[10] & ~osd_btn_d[10];
+wire osd_nmi   = status[11] & ~osd_btn_d[11];
+
 // video-domain reset: two-flop synchronizer of the PLL lock
 reg vrst_meta = 1, vrst = 1;
 always @(posedge clk_vid) begin
@@ -375,6 +387,8 @@ tc_machine #(.CLK_HZ(CLK_SYS_HZ)) machine
 
 	.ps2_key(ps2_key),
 	.ps2_mouse(ps2_mouse),
+	.osd_power(osd_power),
+	.osd_nmi(osd_nmi),
 	.timestamp(timestamp),
 	.pot_on(pot_on),
 	.boot_cmd(boot_cmd),
