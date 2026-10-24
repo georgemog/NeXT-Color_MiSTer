@@ -23,6 +23,7 @@
   DSP code follows Hatari, GPL-2) with its author before publishing.
 - [ ] DSP at 57 MHz: not possible at today's chip usage (95% ALMs); needs the
   CPU's own 57 MHz timing margin improved first.
-- [ ] Delete the failed test cores from the MiSTer when done with them:
+- [x] Delete the failed test cores from the MiSTer:
   `_Computer/NeXT-Color_20261023dsp57test_ap68040.rbf`,
-  `_Computer/NeXT-Color_20261023dsp1x_ap68040.rbf`.
+  `_Computer/NeXT-Color_20261023dsp1x_ap68040.rbf` (deleted 2026-10-24;
+  copies in the 2x-fl and dsp1x worktrees' `releases/`).
