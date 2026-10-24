@@ -17,6 +17,9 @@ module tb_fl;
 
 reg clk = 0, nreset = 0;
 always #5 clk = ~clk;
+// next_ap68040's CPU2X clock: 2 x clk, rising edges aligned with clk's
+reg clk_cpu = 1;
+always #2.5 clk_cpu = ~clk_cpu;
 
 int unsigned seed = 1, cycles = 2000000, fl_every = 40, irq_every = 300, lat_max = 3;
 int unsigned cyc = 0;
@@ -37,7 +40,7 @@ wire [31:4] fill_line;
 wire [31:0] dbg_pc;
 
 next_ap68040 #(.FPU_REVISION(8'h41), .SNOOP(2)) dut (
-	.clk(clk), .nreset(nreset), .ipl(ipl), .berr(1'b0),
+	.clk(clk), .clk_cpu(clk_cpu), .nreset(nreset), .ipl(ipl), .berr(1'b0),
 	.bus_req(bus_req), .bus_write(bus_write), .bus_instr(bus_instr), .bus_size(bus_size),
 	.bus_addr(bus_addr), .bus_wdata(bus_wdata), .bus_fc(bus_fc), .bus_ack(bus_ack), .bus_rdata(bus_rdata),
 	.snoop_stb(1'b0), .snoop_addr(32'd0), .snoop_full(),
@@ -147,8 +150,9 @@ always @(posedge clk) begin
 			n_dma <= n_dma + 1;
 		end
 		else if (!fl_wait && !dma_pend && dir_go) begin
-			// directed: a flush of a DMA-buffer line K clocks after the
-			// kernel's clr.l $66(a0) enters AG
+			// directed: a flush of a DMA-buffer line K core clocks after
+			// the kernel's clr.l $66(a0) enters AG
+			dir_ack <= dir_req;
 			fl_cur  = 28'h0403000 + ($urandom % 64);
 			fl_addr <= fl_cur;
 			fl_req  <= 1'b1;
@@ -168,17 +172,20 @@ end
 reg [31:0]   clr_pc = 0;
 int          dir_k = -1;
 int unsigned dir_cnt = 0;
-reg          dir_arm = 0, dir_go = 0;
+// (on clk_cpu, the core's own clock, K counts core clocks; the request
+// crosses to the clk-side flush requester as a counter pair)
+reg          dir_arm = 0;
+reg    [7:0] dir_req = 0, dir_ack = 0;
+wire         dir_go = (dir_req != dir_ack);
 initial begin void'($value$plusargs("clrpc=%h", clr_pc)); void'($value$plusargs("dirk=%d", dir_k)); end
-always @(posedge clk) begin
-	dir_go <= 1'b0;
+always @(posedge clk_cpu) begin
 	if (nreset && dir_k >= 0) begin
 		if (!dir_arm && dut.cpu.be.ag_v && dut.cpu.be.ag_u.pc == clr_pc && dut.cpu.be.adv_ag) begin
 			dir_arm <= 1'b1; dir_cnt <= 0;
 		end
 		else if (dir_arm) begin
 			dir_cnt <= dir_cnt + 1;
-			if (dir_cnt == dir_k) begin dir_go <= 1'b1; dir_arm <= 1'b0; end
+			if (dir_cnt == dir_k) begin dir_req <= dir_req + 8'd1; dir_arm <= 1'b0; end
 		end
 	end
 end
@@ -205,7 +212,7 @@ end
 
 // ---- coverage
 int unsigned c_ihit = 0, c_snref = 0, c_src0 = 0, c_src1 = 0, c_src2 = 0, c_kill = 0, c_drop = 0, c_icall = 0, c_stcap = 0;
-always @(posedge clk) if (nreset) begin
+always @(posedge clk_cpu) if (nreset) begin
 	if (dut.cpu.be.sn_ihit) c_ihit <= c_ihit + 1;
 	if (dut.cpu.be.adv_ag && dut.cpu.be.ag_snref) c_snref <= c_snref + 1;
 	if (dut.cpu.dmu.sn_look && dut.cpu.dmu.sn_hit) begin
@@ -230,17 +237,18 @@ final $display("COVER ihit %0d snref %0d src way/pv/queued %0d/%0d/%0d kill-in-j
 // ---- checks
 int unsigned last_ret = 0;
 reg [31:0]   last_pc = 0;
+always @(posedge clk_cpu) if (nreset && dut.cpu.dbg_retire) begin
+	// (every core clock: the core retires on clk_cpu)
+	last_ret <= cyc;
+	last_pc  <= dbg_pc;
+	if (dbg_pc[31:8] == 24'h040100) begin
+		$display("FAIL cyc %0d: retired PC %08h in the table (previous %08h); trap %0d flushes %0d dirty %0d irqs %0d",
+		         cyc, dbg_pc, last_pc, n_trap, n_fl, n_fld, n_irq);
+		$finish;
+	end
+end
 always @(posedge clk) if (nreset) begin
 	cyc <= cyc + 1;
-	if (dut.cpu.dbg_retire) begin
-		last_ret <= cyc;
-		last_pc  <= dbg_pc;
-		if (dbg_pc[31:8] == 24'h040100) begin
-			$display("FAIL cyc %0d: retired PC %08h in the table (previous %08h); trap %0d flushes %0d dirty %0d irqs %0d",
-			         cyc, dbg_pc, last_pc, n_trap, n_fl, n_fld, n_irq);
-			$finish;
-		end
-	end
 	if (cyc - last_ret > 20000 && cyc > 20000) begin
 		$display("FAIL cyc %0d: no retirement since %0d (PC %08h)", cyc, last_ret, last_pc);
 		$display("  dmu e_st %0d e_ret %0d sn_ph %0d e_job %0d e_kill %0d bo_cancel %0d bo_ingnt %0d e_breq %0d tw_va %08h tw_da %08h",
