@@ -190,10 +190,11 @@ be lost.
   checked against Hatari instruction by instruction) with the NeXT's host
   port, DSP DMA (packed and unpacked), SCR2 reset / start mode / memory
   enable, IRQB at a DMA block end and the TXD interrupt.  It runs at the
-  machine clock: 14.25 MIPS, a little faster than a real 25 MHz 56001
-  (12.5 MIPS).  External RAM: the standard 8K words (24 KB); no 96 KB
-  expansion.  Not yet tried on hardware with the Music Kit or the Sound
-  Kit's DSP sounds.
+  machine clock, one instruction cycle per two clocks: 16.5 MIPS at
+  33 MHz (a real 25 MHz 56001: 12.5 MIPS).  External RAM: the standard 8K
+  words (24 KB); no 96 KB expansion.  On hardware (2026-10-23) NeXTSTEP
+  boots it, sndplay plays mu-law and ATC-compressed sounds through it, and
+  playscore plays a Music Kit score.
 * The DSP on the ARM (Previous's interpreter in Main, `next-color`, behind
   `rtl/tc_dsp.sv`) is still in the source: `NEXT_DSP_ARM` in
   `NeXT-Color.qsf` selects it.  `NEXT_NO_DSP` leaves the DSP out.
