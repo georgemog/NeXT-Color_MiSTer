@@ -2,13 +2,13 @@
 
 ## General description
 
-A NeXTstation Turbo Color core for MiSTer: a 33 MHz 68040, the Turbo chipset,
+A NeXTstation Turbo Color core for MiSTer: a 50 MHz 68040, the Turbo chipset,
 12-bit colour at 1120x832, NeXT ROM Rev 3.3 v74. It boots NeXTSTEP 3.3 to the
 colour desktop. Work in progress.
 
 | Part | State |
 |---|---|
-| CPU | 68040 at 33 MHz (the AP68040 core of the MacQuadra800 core), FPU, MMU. NWBench Dhrystone 15.1 MIPS |
+| CPU | 68040 at 50 MHz on a 25 MHz machine bus (the pipelined AP68040), FPU, MMU. BenchPress Dhrystone 243 (25 MHz NeXTstation Color = 100) |
 | Memory | 16, 32, 64 (default) or 128 MB in SDRAM |
 | Video | 1120x832 at 68.4 Hz, 12-bit colour (Bt463 palette, TMC timing) |
 | Keyboard and mouse | PS/2 keyboard and mouse as the NeXT keyboard (KMS) |
@@ -190,8 +190,8 @@ be lost.
   checked against Hatari instruction by instruction) with the NeXT's host
   port, DSP DMA (packed and unpacked), SCR2 reset / start mode / memory
   enable, IRQB at a DMA block end and the TXD interrupt.  It runs at the
-  machine clock, one instruction cycle per two clocks: 16.5 MIPS at
-  33 MHz (a real 25 MHz 56001: 12.5 MIPS).  External RAM: the standard 8K
+  machine clock, one instruction cycle per two clocks: 12.5 MIPS at
+  25 MHz, a real 25 MHz 56001's rate.  External RAM: the standard 8K
   words (24 KB); no 96 KB expansion.  On hardware (2026-10-23) NeXTSTEP
   boots it, sndplay plays mu-law and ATC-compressed sounds through it, and
   playscore plays a Music Kit score.
