@@ -665,6 +665,41 @@ assign debug_fault   = flt_seen;
 assign debug_status  = {24'd0, 5'd0, cst, 192'd0, dbg_pc};
 assign debug_status2 = {64'd0, xa, 30'd0, cmaint, dbg_retire};
 
+`ifdef NEXT_A040_SYSENT
+// sim-only: the last 96 clocks of pipeline state, dumped when an
+// instruction retires inside NeXTSTEP 3.3's _sysent (the 'illegal
+// instruction' panic, PC _sysent+$33c) -- the copyback DMA flush hunt
+localparam SW_N = 96;
+reg [63:0] sw_cyc = 0;
+reg  [6:0] sw_wp = 0;
+reg [287:0] sw_ring [0:SW_N-1];
+always @(posedge clk) if (nreset) begin
+	sw_cyc <= sw_cyc + 1;
+	sw_ring[sw_wp] <= {sw_cyc[31:0],
+		cpu.be.ag_v, cpu.be.dc1_v, cpu.be.dc2_v, cpu.be.ex_v, cpu.be.wb_v, cpu.dbg_retire, cpu.be.kill_now, cpu.be.flush,
+		cpu.be.ag_u.pc[23:0], cpu.be.dc2_u.pc[23:0], cpu.be.ex_u.pc[23:0], cpu.be.wb_u.pc[23:0],
+		cpu.be.agb_q, cpu.be.exw_val,
+		cpu.dmu.e_st, cpu.dmu.sn_ph, cpu.dmu.m2.fast, cpu.dmu.e_dc2_done, cpu.dmu.e_job, cpu.dmu.e_kill, nst, fl_req, fl_done,
+		ipl, cpu.be.adv_ag, cpu.be.adv_dc2, cpu.be.adv_ex, cpu.be.cap_b, cpu.be.stale_b, cpu.be.snp_pend, cpu.be.exw_ag,
+		cpu.dmu.ldata_al, 27'd0};
+	sw_wp <= (sw_wp == SW_N - 1) ? 7'd0 : sw_wp + 7'd1;
+	if (cpu.dbg_retire && dbg_pc >= 32'h040AE78C && dbg_pc < 32'h040AED4C) begin
+		$display("[SYSENT] retired %08h at cycle %0d", dbg_pc, sw_cyc);
+		$display("[SYSENT] cyc     ag dc1 dc2 ex wb ret kill fl | ag_pc  dc2_pc ex_pc  wb_pc  | agb_q    exw_val  | e_st sn fast done job kill nst flq fld ipl | aag adc2 aex cap stl snp exwag | ldata_al");
+		for (int i = 0; i < SW_N; i++) begin
+			reg [287:0] r;
+			r = sw_ring[(sw_wp + i) % SW_N];
+			$display("[SYSENT] %0d %b %b %b %b %b %b %b %b | %06h %06h %06h %06h | %08h %08h | %0d %0d %b %b %b %b %0d %b %b %0d | %b %b %b %b %b %b %b | %08h",
+			         r[287:256], r[255], r[254], r[253], r[252], r[251], r[250], r[249], r[248],
+			         r[247:224], r[223:200], r[199:176], r[175:152], r[151:120], r[119:88],
+			         r[87:82], r[81:79], r[78], r[77], r[76], r[75], r[74:71], r[70], r[69], r[68:66],
+			         r[65], r[64], r[63], r[62], r[61], r[60], r[59], r[58:27]);
+		end
+		$finish;
+	end
+end
+`endif
+
 `ifdef NEXT_A040_PERF
 // sim-only: clocks from TS to the transfer's last TA/TEA, by kind and region
 // kind: 0 line read code, 1 line read data, 2 single read, 3 line write,

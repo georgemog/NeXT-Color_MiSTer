@@ -33,6 +33,9 @@ module ap68040_sdp_be #(
 	localparam int SL = (NB > 4) ? 4 : NB;      // bytes per slice
 	localparam int NS = (NB + SL - 1) / SL;     // slices
 	logic [NB*8-1:0] qr;
+`ifdef NEXT_RAM_PESSIMISTIC
+	int n_coll = 0;
+`endif
 	genvar gs, gb;
 	generate
 		for (gs = 0; gs < NS; gs++) begin : g_sl
@@ -41,9 +44,27 @@ module ap68040_sdp_be #(
 				always_ff @(posedge clk)
 					if (we && wbe[gs*SL + gb]) mem[waddr][gb] <= wdata[(gs*SL + gb)*8 +: 8];
 			end
+`ifdef NEXT_RAM_PESSIMISTIC
+			// a read of the word written at the same edge: M10K mixed-port
+			// read-during-write is undefined under no_rw_check -- the bytes
+			// written read as junk (the others as they were)
+			always_ff @(posedge clk) begin
+				logic [SL-1:0][7:0] r;
+				r = mem[raddr];
+				if (we && waddr == raddr && |wbe[gs*SL +: SL]) begin
+					for (int k = 0; k < SL; k++)
+						if (wbe[gs*SL + k]) r[k] = 8'($urandom);
+					n_coll++;
+					if (n_coll <= 4) $display("[RAMX] %m: read of the row written at the same edge, junk returned");
+				end
+				qr[gs*SL*8 +: SL*8] <= r;
+			end
+`else
 			always_ff @(posedge clk) qr[gs*SL*8 +: SL*8] <= mem[raddr];
+`endif
 		end
 	endgenerate
+
 	generate
 		if (OREG) begin : g_oreg
 			always_ff @(posedge clk) if (oce) q <= qr;
@@ -81,11 +102,29 @@ module ap68040_tdp #(
 	logic [DW-1:0] qa_r, qb_r, wa_d, wb_d;
 	logic [AW-1:0] ra, rb, wa_q, wb_q;
 	logic          wa_v, wb_v;
+`ifdef NEXT_RAM_PESSIMISTIC
+	int n_coll = 0;
+`endif
 	always_ff @(posedge clk) begin
 		if (we_a) mem[addr_a] <= wd_a;
 		if (we_b) mem[addr_b] <= wd_b;
+`ifdef NEXT_RAM_PESSIMISTIC
+		// a port reading a word either port writes at this edge: undefined
+		// on M10K under no_rw_check (q_a/q_b bypass it; qa_raw does not)
+		if ((we_a && addr_a == addr_a) || (we_b && addr_b == addr_a)) begin
+			qa_r <= DW'({$urandom, $urandom}); n_coll++;
+			if (n_coll <= 4) $display("[RAMX] %m: port A read of a row written at the same edge, junk returned");
+		end
+		else qa_r <= mem[addr_a];
+		if ((we_b && addr_b == addr_b) || (we_a && addr_a == addr_b)) begin
+			qb_r <= DW'({$urandom, $urandom}); n_coll++;
+			if (n_coll <= 4) $display("[RAMX] %m: port B read of a row written at the same edge, junk returned");
+		end
+		else qb_r <= mem[addr_b];
+`else
 		qa_r <= mem[addr_a];
 		qb_r <= mem[addr_b];
+`endif
 		ra   <= addr_a;
 		rb   <= addr_b;
 		wa_v <= we_a; wa_q <= addr_a; wa_d <= wd_a;
@@ -177,10 +216,22 @@ module ap68040_sdpr #(
 	// RAM's own read-during-write semantics, so no bypass logic is built)
 	(* ramstyle = "M10K, no_rw_check" *) logic [DW-1:0] mem [0:(1<<AW)-1];
 	initial for (int i = 0; i < (1 << AW); i++) mem[i] = '0;
+`ifdef NEXT_RAM_PESSIMISTIC
+	int n_coll = 0;
+	always_ff @(posedge clk) begin
+		if (we) mem[waddr] <= wdata;
+		if (we && waddr == raddr) begin
+			q <= DW'({$urandom, $urandom}); n_coll++;
+			if (n_coll <= 4) $display("[RAMX] %m: read of the row written at the same edge, junk returned");
+		end
+		else q <= mem[raddr];
+	end
+`else
 	always_ff @(posedge clk) begin
 		if (we) mem[waddr] <= wdata;
 		q <= mem[raddr];
 	end
+`endif
 endmodule
 
 //--------------------------------------------------------------------------
