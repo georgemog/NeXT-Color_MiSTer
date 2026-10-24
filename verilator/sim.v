@@ -212,6 +212,7 @@ tc_machine machine
 	.fsd_ack(fsd_ack),
 	.fsd_buff_din(fsd_buff_din),
 	.enet_connected(enet_connected),
+	.enet_mode(enet_connected ? 3'd1 : 3'd0),
 	.enet_m_req(enet_m_req),
 	.enet_m_we(enet_m_we),
 	.enet_m_addr(enet_m_addr),
@@ -260,7 +261,7 @@ wire        SDRAM_DQML, SDRAM_DQMH;
 wire  [1:0] SDRAM_BA;
 wire        SDRAM_nCS, SDRAM_nWE, SDRAM_nRAS, SDRAM_nCAS, SDRAM_CKE, SDRAM_CLK;
 
-// +enet: the OSD "Ethernet: Connected" (the DDR3 model echoes each frame
+// +enet: the OSD "Network interface: eth0" (the DDR3 model echoes each frame
 // the guest sends back to it as a received one, see ddr3_model.sv)
 reg         enet_connected = 1'b0;
 initial if ($test$plusargs("enet")) enet_connected = 1'b1;

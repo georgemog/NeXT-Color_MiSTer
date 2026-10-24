@@ -99,10 +99,14 @@ localparam CONF_STR = {
 	// larger choice runs as the module's size (ram_cfg below).  "v,1" dropped
 	// the settings saved with the old order (64 MB, Prompt, Normal first).
 	"O[4:3],Memory,32MB,64MB,128MB,16MB;",
-	// Ethernet: Main's next_enet daemon reads the mode from status[54:52]
-	// (0 off, 1 eth0 shared + MAC filter, ...); this switch is bit 52 alone,
-	// so Connected = mode 1.  rtl/tc_enet.sv: a twisted-pair link.
-	"O[52],Ethernet,Disconnected,Connected;",
+	// Network interface: latched (cfg) and published to Main's next_enet
+	// daemon in the bridge's mailbox (NET_MODE, magic "NXTETH02",
+	// rtl/next_enet_bridge.sv), so it too waits for Apply and reset.  None
+	// unplugs the cable (rtl/tc_enet.sv).  No wlan0: Main's bridge has none.
+	// Bit 52 was the old "Ethernet,Disconnected,Connected" switch and bits
+	// 53:54 are Main's status mode for the mono NeXT core (NXTETH01): never
+	// reuse them.  Every saved v,1 setting reads 0 here = eth0.
+	"O[57:55],Network interface,eth0,None,eth1,macvlan,tap0;",
 	"-;",
 	"P1,Machine;",
 	"P2,Video;",
@@ -282,7 +286,20 @@ end
 // h0 row) shows while a latched field differs from the running one.
 reg [125:0] cfg = 126'd0;
 always @(posedge clk_sys) if (config_reset) cfg <= status[125:0];
-assign cfg_pending = {status[8:3], status[125:121]} != {cfg[8:3], cfg[125:121]};
+assign cfg_pending = {status[8:3], status[57:55], status[125:121]} !=
+                     {cfg[8:3],    cfg[57:55],    cfg[125:121]};
+
+// Network interface: OSD order eth0, None, eth1, macvlan, tap0 -> Main's
+// NB_MODE_ 1, 0, 2, 3, 4 (support/next/next_enet.cpp).
+reg [2:0] net_mode;
+always @(*) case (cfg[57:55])
+	3'd0:    net_mode = 3'd1;   // eth0 (shared, promiscuous + the MAC filter)
+	3'd2:    net_mode = 3'd2;   // eth1
+	3'd3:    net_mode = 3'd3;   // macvlan
+	3'd4:    net_mode = 3'd4;   // tap0
+	default: net_mode = 3'd0;   // None
+endcase
+wire net_connected = (net_mode != 3'd0);
 
 // Memory, no larger than the SDRAM module.  Sizes as ranks: 0 = 16 MB,
 // 1 = 32, 2 = 64, 3 = 128; the OSD order 32, 64, 128, 16 MB is rank - 1.
@@ -432,7 +449,8 @@ tc_machine #(.CLK_HZ(CLK_SYS_HZ)) machine
 	.fsd_wr(fsd_wr),
 	.fsd_ack(sd_ack_v[4]),
 	.fsd_buff_din(fsd_buff_din),
-	.enet_connected(status[52]),
+	.enet_connected(net_connected),
+	.enet_mode(net_mode),
 	.enet_m_req(enet_m_req),
 	.enet_m_we(enet_m_we),
 	.enet_m_addr(enet_m_addr),

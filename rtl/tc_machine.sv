@@ -122,9 +122,12 @@ module tc_machine
 	input             fsd_ack,
 	output      [7:0] fsd_buff_din,
 
-	// Ethernet: the OSD "Connected" switch, and the bridge's mailbox port
-	// (one 64-bit DDR3 word at a time, clk_sys; tc_enet_ddr in the top)
+	// Ethernet: the OSD's network interface (connected = not None, and the
+	// mode Main's daemon opens, next_enet_bridge NET_MODE), and the bridge's
+	// mailbox port (one 64-bit DDR3 word at a time, clk_sys; tc_enet_ddr in
+	// the top)
 	input             enet_connected,
+	input       [2:0] enet_mode,
 	output            enet_m_req,
 	output            enet_m_we,
 	output     [28:0] enet_m_addr,
@@ -599,7 +602,7 @@ wire [28:0] br_m_addr;
 wire [63:0] br_m_wdata;
 
 // AT&T 7213 Ethernet (HS 8): rtl/tc_enet.sv, internal loopback for the
-// POST, and with the OSD's "Connected" a twisted-pair link through
+// POST, and with an OSD network interface other than None a twisted-pair link through
 // NeXT_MiSTer's bridge (rtl/next_enet_bridge.sv) to Main's next_enet daemon
 // (a DDR3 mailbox at $1FF00000).  Its data moves through tc_tdma's
 // Ethernet TX/RX channels.
@@ -611,7 +614,7 @@ wire [10:0] brx_len;
 wire  [7:0] brx_data;
 wire [47:0] enet_mac;
 next_enet_bridge #(.CLK_HZ(CLK_HZ)) enet_bridge (
-	.clk(clk), .reset(dev_rst), .enable(enet_connected),
+	.clk(clk), .reset(dev_rst), .enable(enet_connected), .net_mode(enet_mode),
 	.btx_req(btx_req), .btx_len(btx_len), .btx_addr(btx_addr), .btx_rd(btx_rd),
 	.btx_q(btx_q), .btx_ack(btx_ack), .btx_done(btx_done),
 	.brx_start(brx_start), .brx_len(brx_len), .brx_valid(brx_valid),
