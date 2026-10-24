@@ -127,6 +127,7 @@ wire         cfg_pending;      // a latched setting waits for Apply and reset
 wire  [10:0] ps2_key;
 wire  [24:0] ps2_mouse;
 wire  [32:0] timestamp;
+wire  [15:0] sdram_sz;         // Main's SDRAM module size (UIO_SET_MEMSZ)
 
 wire        ioctl_download;
 wire [15:0] ioctl_index;
@@ -170,6 +171,7 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(0), .VDNUM(5)) hps_io
 	.ps2_key(ps2_key),
 	.ps2_mouse(ps2_mouse),
 	.TIMESTAMP(timestamp),
+	.sdram_sz(sdram_sz),
 
 	.ioctl_download(ioctl_download),
 	.ioctl_index(ioctl_index),
@@ -272,14 +274,25 @@ reg [125:0] cfg = 126'd0;
 always @(posedge clk_sys) if (config_reset) cfg <= status[125:0];
 assign cfg_pending = {status[8:3], status[125:121]} != {cfg[8:3], cfg[125:121]};
 
+// Memory, no larger than the SDRAM module.  Sizes as ranks: 0 = 16 MB,
+// 1 = 32, 2 = 64, 3 = 128; the OSD order 32, 64, 128, 16 MB is rank - 1.
+// sdram_sz[15] says Main knows the module, [1:0] 1 = 32 MB, 2 = 64 MB,
+// 3 = 128 MB (sys/hps_io.sv, Main's sdram_sz()).  An unknown module (Main
+// never sent it) leaves the choice alone, as before.  A choice above the
+// module used to make NeXTSTEP panic; now it runs as the module's size.
+wire [1:0] mem_want = status[4:3] + 2'd1;
+wire [1:0] mem_max  = !sdram_sz[15]          ? 2'd3 :
+                      (sdram_sz[1:0] == 2'd0) ? 2'd1 : sdram_sz[1:0];
+wire [1:0] mem_rank = (mem_want > mem_max) ? mem_max : mem_want;
+
 // Machine configuration, sampled while the machine is in reset.
 reg  [1:0] ram_cfg  = 2'd0;
 reg        pot_on   = 1'b1;
 reg [95:0] boot_cmd = 96'd0;
 always @(posedge clk_sys) if (config_reset) begin
-	// OSD order 32, 64, 128, 16 MB -> ram_cfg 3, 0, 1, 2 (0 = 64 MB, 1 = 128 MB,
-	// 2 = 16 MB, 3 = 32 MB, rtl/tc_mccs1850.sv)
-	ram_cfg <= status[4:3] - 2'd1;
+	// rank 1, 2, 3, 0 (32, 64, 128, 16 MB) -> ram_cfg 3, 0, 1, 2 (0 = 64 MB,
+	// 1 = 128 MB, 2 = 16 MB, 3 = 32 MB, rtl/tc_mccs1850.sv)
+	ram_cfg <= mem_rank - 2'd2;
 	pot_on  <= ~status[5];
 	case (status[8:6])                      // OSD order: SCSI disk, Prompt, Network, Floppy
 	3'd0:    boot_cmd <= {"sd", 80'd0};
