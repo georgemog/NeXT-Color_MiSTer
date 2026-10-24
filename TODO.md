@@ -28,8 +28,8 @@
   notes (DSP voice limit) or whether the FPGA DSP is short of time or memory.
 - [ ] Finish the full NeXTSTEP boot simulation with the `jsr` forwarding fix
   (the unfixed core failed at about 211 s of machine time).
-- [ ] Confirm the licence of apolkosnik/Falcon_MiSTer (no LICENSE file; the
-  DSP code follows Hatari, GPL-2) with its author before publishing.
+- [x] Falcon_MiSTer licence: Adam Polkosnik knows of and agrees to the use of
+  his DSP56001 code (2026-10-24).
 - [ ] DSP at 57 MHz: not possible at today's chip usage (95% ALMs); needs the
   CPU's own 57 MHz timing margin improved first.
 - [x] Delete the failed test cores from the MiSTer:
