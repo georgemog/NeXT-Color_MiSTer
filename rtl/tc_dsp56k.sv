@@ -8,8 +8,8 @@
 //
 //  This replaces rtl/tc_dsp.sv's link to Previous's interpreter on the ARM
 //  (NEXT_DSP_ARM in the qsf selects that one again).  The DSP runs one DSP
-//  clock per clk: 2 clocks per instruction cycle, 16.5 MIPS at 33 MHz
-//  (a real 25 MHz 56001: 12.5 MIPS).
+//  clock per clk: 2 clocks per instruction cycle, 12.5 MIPS at the 25 MHz
+//  machine clock, a real 25 MHz 56001's rate.
 //
 //  "dsp.c:n" / "dsp_core.c:n" / "sysReg.c:n" = Previous r1851 src/dsp and src.
 //
