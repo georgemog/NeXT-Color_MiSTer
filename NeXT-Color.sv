@@ -106,6 +106,7 @@ localparam CONF_STR = {
 	"-;",
 	"P1,Machine;",
 	"P2,Video;",
+	"P3,Input;",
 	"P5,Advanced;",
 	"-;",
 	"h0-,Changes pending;",
@@ -119,6 +120,9 @@ localparam CONF_STR = {
 	// V-Integer first (the default): 1:1 1120x832 on a 1080p display.
 	"P2O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"P2O[125:123],Scale,V-Integer,Normal,Narrower HV-Integer,Wider HV-Integer;",
+
+	// Input acts at once (not latched)
+	"P3O[9],Swap Alt/Win keys,No,Yes;",
 
 	"P5O[8:6],Boot device,SCSI disk,Prompt,Network,Floppy;",
 	"P5O[5],Self test,On,Off;",
@@ -314,6 +318,22 @@ always @(posedge clk_sys) osd_btn_d <= status[11:10];
 wire osd_power = status[10] & ~osd_btn_d[10];
 wire osd_nmi   = status[11] & ~osd_btn_d[11];
 
+// Input: Swap Alt/Win keys (status[9], at once).  The Win keys are the
+// NeXT's Command keys and Alt its Alternate keys (rtl/tc_kms.sv); with the
+// swap, left Alt <-> left GUI and right Alt <-> right GUI (ps2_key [8] =
+// extended, [7:0] = the set-2 code).  The magic reset (L-Win + L-Alt +
+// keypad *) still works because both keys swap.
+function automatic [8:0] alt_win(input [8:0] k);
+	case (k)
+		9'h011: alt_win = 9'h11F;   // left Alt -> left GUI
+		9'h11F: alt_win = 9'h011;
+		9'h111: alt_win = 9'h127;   // right Alt -> right GUI
+		9'h127: alt_win = 9'h111;
+		default: alt_win = k;
+	endcase
+endfunction
+wire [10:0] kbd_key = status[9] ? {ps2_key[10:9], alt_win(ps2_key[8:0])} : ps2_key;
+
 // video-domain reset: two-flop synchronizer of the PLL lock
 reg vrst_meta = 1, vrst = 1;
 always @(posedge clk_vid) begin
@@ -385,7 +405,7 @@ tc_machine #(.CLK_HZ(CLK_SYS_HZ)) machine
 	.pal_d(pal_d),
 	.vbl_pulse(vbl_pulse),
 
-	.ps2_key(ps2_key),
+	.ps2_key(kbd_key),
 	.ps2_mouse(ps2_mouse),
 	.osd_power(osd_power),
 	.osd_nmi(osd_nmi),
