@@ -9,7 +9,7 @@ colour desktop. Work in progress.
 | Part | State |
 |---|---|
 | CPU | 68040 at 50 MHz on a 25 MHz machine bus (the pipelined AP68040), FPU, MMU. BenchPress Dhrystone 243 (25 MHz NeXTstation Color = 100) |
-| Memory | 16, 32, 64 (default) or 128 MB in SDRAM |
+| Memory | 16, 32 (default), 64 or 128 MB in SDRAM, no more than the SDRAM module |
 | Video | 1120x832 at 68.4 Hz, 12-bit colour (Bt463 palette, TMC timing) |
 | Keyboard and mouse | PS/2 keyboard and mouse as the NeXT keyboard (KMS) |
 | SCSI | Two hard disks and a CD-ROM drive (images on the SD card) |
@@ -32,8 +32,8 @@ colour desktop. Work in progress.
 2. **Boot ROM**: `releases/boot0.rom` (NeXT ROM Rev 3.3 v74, the NeXTstation
    Turbo's ROM) in `games/NeXT-Color/` -- the folder name is exactly the core's
    name, with a hyphen. Main loads `boot0.rom`, or `boot.rom` if there is no
-   `boot0.rom`, each time the core starts; the OSD's "Load boot ROM" loads
-   another one. Do not copy the mono NeXT core's files into this folder: its
+   `boot0.rom`, each time the core starts; the OSD's "Load ROM" loads
+   another one for that session. Do not copy the mono NeXT core's files into this folder: its
    `boot1.rom` is a 68030 ROM (Rev 2.5), which this core cannot run (see
    Troubleshooting).
 3. **Main**: this core needs the `next-color` build of Main_MiSTer
@@ -47,6 +47,10 @@ colour desktop. Work in progress.
    `MiSTer.stock`), then `sync` and reboot. It runs the other cores as the
    stock Main does.
 
+   The network needs a Main that reads the network interface from the core
+   (`NXTETH02`, Main_MiSTer `support/next/next_enet.cpp`, 2026-10 or later).
+   An older Main runs everything else, but the network stays off.
+
    Check it: load the core, open the OSD, press right, open **About**. The
    MiSTer version must be **v261009** or later. Anything older means the stock Main is
    running.
@@ -56,8 +60,8 @@ colour desktop. Work in progress.
    20261010 and later; the cores before stayed black when loaded that way
    (see Troubleshooting).
 4. **Disk**: a NeXTSTEP disk image (`.hda`, `.vhd` or `.img`; rename a `.dd`
-   image to `.img`) in the OSD's "SCSI disk 0" slot. "Boot device" is "SCSI
-   disk" by default, so the ROM boots it. Images are written to: work on a
+   image to `.img`) in the OSD's "Pri. disk (ID 0)" slot. "Boot device" is
+   "SCSI disk" by default, so the ROM boots it. Images are written to: work on a
    copy.
 5. **Display**: give the core its own 1080p section in `MiSTer.ini` (next
    section).
@@ -68,22 +72,39 @@ the disk image is open for writing.
 
 ## OSD menu
 
-The 2026-10 core reordered Memory, Boot device and Scale so that the defaults
-are 32 MB, SCSI disk and V-Integer, and so it forgets the OSD settings saved by older releases
-once: set Memory, Ethernet and the display options again after updating.
+The menu follows the MiSTer OSD standard
+(danifunker/hp9000-715_MiSTer `docs/osd-standard.md`). The top page:
 
 | Entry | What it does |
 |---|---|
-| SCSI disk 0 / SCSI disk 1 | Hard disk images (`.hda`, `.vhd`, `.img`) for SCSI targets 0 and 1; remembered and mounted again when the core starts |
-| CD-ROM | A disc image (`.iso`, `.cue`/`.bin`, `.chd`) in the CD-ROM drive, SCSI target 3; not remembered |
+| Pri. disk (ID 0) / Disk (ID 1) | Hard disk images (`.hda`, `.vhd`, `.img`) for SCSI targets 0 and 1. Target 0 is the boot disk |
+| CD-ROM (ID 3) | A disc image (`.iso`, `.cue`/`.bin`, `.chd`) in the CD-ROM drive, SCSI target 3 |
 | Floppy | A floppy image (`.img`, `.ima`, `.flp`, `.vfd`, `.fd`) in the floppy drive |
-| Memory | 32 MB (default), 64 MB, 128 MB or 16 MB. The MiSTer's SDRAM module must be at least as large: 64 MB needs a 64 or 128 MB module, 128 MB (the Turbo's maximum, 4 x 32 MB) a 128 MB module. More memory than the module has makes NeXTSTEP panic |
-| Power-on self test | On: the ROM tests the machine at power-on; Off: faster start |
-| Boot device | SCSI disk (default), Prompt (stay at `NeXT>`), Network or Floppy; written to the NVRAM boot command |
-| Ethernet | Disconnected (no cable) or Connected (on the MiSTer's LAN) |
-| Aspect ratio, Scale | How the scaler fits the picture (see Display) |
-| Load boot ROM | Load a different ROM file |
-| Reset | Reset the machine; the disk mounts stay. The NVRAM is not kept: at power-on and reset it gets a default image with the OSD's boot device |
+| Load ROM | Load a different boot ROM for this session; the next start loads `boot0.rom` again |
+| Memory | 32MB (default), 64MB, 128MB or 16MB. The machine never gets more than the MiSTer's SDRAM module has: 128MB on a 32 MB module runs as 32 MB |
+| Network interface | eth0 (default), None, eth1, macvlan or tap0: what the Turbo's Ethernet is wired to (see Network). None is a machine without a cable |
+| Machine > | P1: the **Power key** (NeXTSTEP's power-off panel, as F10) and **NMI (monitor)** (the ROM monitor, as F11) |
+| Video > | P2: **Aspect ratio** and **Scale**, how the scaler fits the picture (see Display) |
+| Input > | P3: **Swap Alt/Win keys** (see Keyboard and mouse) |
+| Advanced > | P5: **Boot device** (SCSI disk (default), Prompt = stay at `NeXT>`, Network or Floppy; written to the NVRAM boot command) and **Self test** (On: the ROM tests the machine at power-on; Off: a faster start) |
+| Changes pending | Shown while a changed setting is waiting for Apply and reset |
+| Apply and reset | Reset the machine with the current settings and close the OSD; the disk mounts stay |
+
+**When settings take effect.** The disks and Input act at once. Everything
+else (Memory, Network interface, Video, Advanced) is taken at the next reset:
+Apply and reset, the MiSTer's reset button or the next core start. Until then
+"Changes pending" shows. The keyboard's reset (Win+Alt+keypad *) restarts
+the machine with the settings it is running. The NVRAM is not kept: at
+power-on and at each reset it gets a default image with the OSD's boot device.
+
+All disk slots, the CD-ROM and the floppy included, are remembered and
+mounted again when the core starts.
+
+**Updating from an older release.** The 2026-10 menu keeps the saved
+settings: Memory, Self test, Boot device, Aspect ratio and Scale carry over.
+The network is the exception: the old "Ethernet" switch is gone, and
+"Network interface" starts at eth0 for everyone, so a core that was
+"Disconnected" is now on the LAN. Pick None once to turn it off.
 
 ## Display: use 1080p
 
@@ -149,8 +170,9 @@ menu, and there is no composite or S-Video output (see Building).
   NeXTSTEP finds it at boot ("PreviousCD-ROM ... as sd1 at sc0 target 3") and
   a disc mounted in the OSD while NeXTSTEP runs appears in the Workspace
   (tested with NeXT software CDs; NeXT UFS discs mount as `/<volume name>`).
-  The mount is not remembered.
-* **Floppy**: the 82077 and a 2.88 MB drive. NeXTSTEP attaches it as `fd0`;
+  The mount is remembered, like the disks'.
+* **Floppy**: the 82077 and a 2.88 MB drive (remembered too: a writable
+  image stays in the drive at the next start). NeXTSTEP attaches it as `fd0`;
   the Workspace's Initialize formats an image at 2.88 MB, and files written
   there land in the image on the SD card. NeXTSTEP 3.3 does not read a DOS
   file system on a 2.88 MB disk (its sectors read correctly).
@@ -159,23 +181,37 @@ menu, and there is no composite or S-Video output (see Building).
 
 ## Network
 
-Set the OSD **Ethernet** to "Connected": the Turbo's 7213 Ethernet is bridged
-to the MiSTer's wired eth0 (shared with Linux; the guest's own MAC,
-00:00:0F:12:34:56, is filtered). NeXTSTEP 3.3 has no DHCP client: its
-`-AUTOMATIC-` setting is BOOTP, which most routers do not answer, so give it a
-static address, for example as root:
+The OSD's **Network interface** chooses what the Turbo's 7213 Ethernet is
+wired to; it takes effect at the next reset (Apply and reset):
+
+| Value | |
+|---|---|
+| eth0 (default) | The MiSTer's wired eth0, shared with Linux; the guest's own MAC, 00:00:0F:12:34:56, is filtered |
+| None | No cable |
+| eth1 | A second wired interface, if the MiSTer has one (else off) |
+| macvlan | A macvlan interface on eth0 |
+| tap0 | A tap interface, for a bridge set up on the Linux side |
+
+This needs a Main that reads the interface from the core (Installing, step
+3). NeXTSTEP 3.3 has no DHCP client: its `-AUTOMATIC-` setting is BOOTP,
+which most routers do not answer, so give it a static address, for example
+as root:
 
 ```
 ifconfig en0 192.168.1.38 netmask 255.255.255.0 up
 ```
 
 or permanently with HostManager, or `INETADDR`, `IPNETMASK` and `ROUTER` in
-`/etc/hostconfig`. "Disconnected" is a machine without a cable.
+`/etc/hostconfig`.
 
 ## Keyboard and mouse
 
 A PS/2 (or USB, through the MiSTer) keyboard and mouse act as the NeXT keyboard
-and mouse. The Command keys are the Windows keys; the volume keys work. At the
+and mouse. The Command keys are the Windows keys and the Alternate keys the
+Alt keys; **Swap Alt/Win keys** (Input page, acts at once) swaps them, so the
+key next to the space bar is Command, as on a NeXT keyboard. The volume keys
+work. F10 is the power key and F11 enters the ROM monitor (NMI); the Machine
+page has the same two as buttons. Win+Alt+keypad * resets the machine. At the
 login window move the mouse once before typing, the first keys after boot can
 be lost.
 
@@ -206,8 +242,10 @@ be lost.
 | Black screen, no POST, every time the core is loaded from the menu, with `main=` in `MiSTer.ini` | A core before 20261010: update the core. Main restarts once more to switch binaries, and that second core reset made the framework's DDR3 port drop the core's video-memory reads, which left the video memory (and the CPU) waiting forever. Fixed in 20261010 |
 | Black screen, no POST (no "Testing system" screen, no disk access) | The core is running a ROM other than Rev 3.3 v74. `games/NeXT-Color/` should hold `boot0.rom` from `releases/` and no other `boot*.rom`: Main also loads `boot1.rom`, `boot2.rom` and `boot3.rom` at start, and cores before 2026-10 took them as the boot ROM, so a `boot1.rom` copied from the mono NeXT core (Rev 2.5, a 68030 ROM) replaced the Turbo ROM. Remove the extra files and load the core again |
 | `No SCSI disk`, or `SCSI error` | The stock Main is running. Check OSD -> About shows MiSTer v261009 or later (Installing, step 3) |
-| NeXTSTEP panics during boot (for example at the network) | More memory selected than the MiSTer's SDRAM module has: set Memory to 32 MB |
-| Stops at `NeXT>` | Boot device is "Prompt", or no disk image is mounted in "SCSI disk 0": mount one and type `bsd`, or set Boot device to "SCSI disk" and Reset |
+| NeXTSTEP panics during boot (for example at the network) | With a core before 2026-10: more memory selected than the MiSTer's SDRAM module has; set Memory to 32 MB. Newer cores never give the machine more than the module |
+| No network (the link is up but nothing answers) | Network interface is None, or the Main is too old to read it (Installing, step 3): an older Main leaves the network off |
+| A setting changed but nothing happened | Settings outside the disks and Input wait for the next reset ("Changes pending"): use Apply and reset |
+| Stops at `NeXT>` | Boot device is "Prompt", or no disk image is mounted in "Pri. disk (ID 0)": mount one and type `bsd`, or set Boot device to "SCSI disk" and Apply and reset |
 | Blurry text | Display not set up: give the core a 1080p section in `MiSTer.ini` (Display) |
 
 ## Known limitations
