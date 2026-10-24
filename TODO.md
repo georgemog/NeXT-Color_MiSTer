@@ -15,8 +15,17 @@
 - [ ] Timing: `dsp56k-50` seed 4 checked at the slow 100 C corner only; its
   only miss is the framework HDMI scaler clock (-0.093 ns). Check all four
   corners, or take a fully clean seed from the sweep (seeds 1, 5, 6, 7).
-- [ ] Heavier Music Kit scores (BachFugue, Twilight, Jungle, CoventryCarol):
-  not on the disk; copy them over and run `playscore` (as root over telnet).
+- [x] Music Kit scores through the FPGA DSP (2026-10-24, dsp50fix build, live
+  `playscore` as root): the 16 Nebula SE scores (`/NEBULA_SE/Audio/Score`) are
+  in `/LocalLibrary/Music/Scores`.  CoventryCarol played through (52 s, rc 0);
+  FugueCMajor played through (rc 0, two "SynthInstrument: Omitting note"
+  messages at 64 s and 66 s: no free synth voice then); Pachelbel ran the
+  full 5 min test window, stopped by hand.  User: the DSP works.
+- [ ] BachFugue, Twilight, Jungle: on the NeXTSTEP-Apps3 CD only (not on the
+  MiSTer or this Mac); try them if that image turns up.  They hung on the old
+  ARM DSP.
+- [ ] FugueCMajor's "Omitting note": check whether a real NeXT drops the same
+  notes (DSP voice limit) or whether the FPGA DSP is short of time or memory.
 - [ ] Finish the full NeXTSTEP boot simulation with the `jsr` forwarding fix
   (the unfixed core failed at about 211 s of machine time).
 - [ ] Confirm the licence of apolkosnik/Falcon_MiSTer (no LICENSE file; the
