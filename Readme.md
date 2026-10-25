@@ -6,6 +6,14 @@ A NeXTstation Turbo Color core for MiSTer: a 50 MHz 68040, the Turbo chipset,
 12-bit colour at 1120x832, NeXT ROM Rev 3.3 v74. It boots NeXTSTEP 3.3 to the
 colour desktop. Work in progress.
 
+**Release candidate 20261025** (`releases/NeXT-Color_20261025.rbf`, md5
+`379f9b27e6c83c7e5beb16bd58e99fae`, with `releases/MiSTer`, the Main it
+needs for the network): timing met on every clock at all four corners.  On
+hardware it boots NeXTSTEP 3.3 (3 of 3), BenchPress scores Dhrystone 243,
+Integer 287, Floating Point 142, the DSP plays mu-law and ATC sounds and
+Music Kit scores, and with this Main the network comes up on eth0 (the
+network was tried on the seed 4 build of the same source).
+
 | Part | State |
 |---|---|
 | CPU | 68040 at 50 MHz on a 25 MHz machine bus (the pipelined AP68040), FPU, MMU. BenchPress Dhrystone 243 (25 MHz NeXTstation Color = 100) |
@@ -16,17 +24,19 @@ colour desktop. Work in progress.
 | Floppy | 2.88 MB drive (720K, 1.44M and 2.88M images) |
 | Ethernet | On the MiSTer's LAN (optional) |
 | Sound out | 16-bit stereo, 44.1 and 22.05 kHz |
-| DSP56001 | In the FPGA, 8K words of external RAM (see "Sound and DSP"); untested on hardware |
+| DSP56001 | In the FPGA, 12.5 MIPS, 8K words of external RAM (see "Sound and DSP"); Sound Kit and Music Kit work |
 | Sound in, DSP serial port, printer, ADB | Not present |
 
 * Design decisions: `docs/DECISIONS.md`. Hand-off state: the newest
   `RESUME-*.md`. ROM analysis (the RTL spec):
   `rom-dissassembly/hardware-summary.md`. Hardware references: `RESOURCES.md`.
-  Release builds: `releases/`; their notes: `RELEASES.md`.
+  Release builds: `releases/` (`NeXT-Color_<date>.rbf`, the newest is the
+  one to use; `MiSTer`, the Main for it; `boot0.rom`).
 
 ## Installing
 
-1. **Core**: the rbf in `_Unstable/` (or `_Computer/`) as `NeXT-Color.rbf`.
+1. **Core**: `releases/NeXT-Color_20261025.rbf` in `_Computer/` (or
+   `_Unstable/`); keep the date in the name, as MiSTer's other cores do.
    Load it directly, not through an `.mgl` file (an MGL load once corrupted the
    remembered disk mount, `config/NeXT-Color.s0`).
 2. **Boot ROM**: `releases/boot0.rom` (NeXT ROM Rev 3.3 v74, the NeXTstation
@@ -36,11 +46,14 @@ colour desktop. Work in progress.
    another one for that session. Do not copy the mono NeXT core's files into this folder: its
    `boot1.rom` is a 68030 ROM (Rev 2.5), which this core cannot run (see
    Troubleshooting).
-3. **Main**: this core needs the `next-color` build of Main_MiSTer
-   (`releases/MiSTer`, the build for this release). The NeXT-Color support
-   is merged in the official Main (MiSTer-devel/Main_MiSTer #1329); once an
-   official Main release includes it, the stock Main works and this step goes
-   away. It serves the SCSI
+3. **Main**: `releases/MiSTer` is the Main for this release: Main_MiSTer
+   with the NeXT network fix (the core chooses the interface, `NXTETH02`,
+   `support/next/next_enet.cpp`; offered to MiSTer-devel/Main_MiSTer), built
+   2026-10-24 (About shows v261024), md5 `47d819b06e1ba9044d778f3c519155b6`.
+   The rest of the NeXT-Color support is merged in the official Main
+   (MiSTer-devel/Main_MiSTer #1329); once an official Main release includes
+   the network fix too, the stock Main works and this step goes away. Main
+   serves the SCSI
    target responses, the CD-ROM images, the Ethernet bridge and the battery
    clock. A stock Main boots to `NeXT>` but finds no disk ("No SCSI disk").
    Replace `/media/fat/MiSTer` with it (keep the old one, for example as
@@ -55,8 +68,10 @@ colour desktop. Work in progress.
    MiSTer version must be **v261009** or later. Anything older means the stock Main is
    running.
 
-   A `main=MiSTer_NeXT-Color` line in the core's `MiSTer.ini` section (the
-   Main as a second file, used for this core only) also works with
+   Or, to leave the stock Main in place, copy it as
+   `/media/fat/MiSTer_NeXT-Color` and add a `main=MiSTer_NeXT-Color` line to
+   the core's `[NeXT-Color]` section in `MiSTer.ini` (the Main as a second
+   file, used for this core only). That works with
    20261010 and later; the cores before stayed black when loaded that way
    (see Troubleshooting).
 4. **Disk**: a NeXTSTEP disk image (`.hda`, `.vhd` or `.img`; rename a `.dd`
@@ -228,9 +243,10 @@ be lost.
   enable, IRQB at a DMA block end and the TXD interrupt.  It runs at the
   machine clock, one instruction cycle per two clocks: 12.5 MIPS at
   25 MHz, a real 25 MHz 56001's rate.  External RAM: the standard 8K
-  words (24 KB); no 96 KB expansion.  On hardware (2026-10-23) NeXTSTEP
-  boots it, sndplay plays mu-law and ATC-compressed sounds through it, and
-  playscore plays a Music Kit score.
+  words (24 KB); no 96 KB expansion.  On hardware (2026-10-23 to 10-25)
+  NeXTSTEP boots it, sndplay plays mu-law and ATC-compressed sounds through
+  it, and playscore plays Music Kit scores (CoventryCarol, FugueCMajor,
+  WTC1, Pachelbel, Vivaldi).
 * The DSP on the ARM (Previous's interpreter in Main, `next-color`, behind
   `rtl/tc_dsp.sv`) is still in the source: `NEXT_DSP_ARM` in
   `NeXT-Color.qsf` selects it.  `NEXT_NO_DSP` leaves the DSP out.
