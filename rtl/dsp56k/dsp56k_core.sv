@@ -56,7 +56,7 @@
 //     while SCR2 DSP_MEM_EN is set (mem_en; reads 0, writes dropped when
 //     not).  P: ext[12:0].  X/Y with A15 = 0 alias P (ext[12:0]); with
 //     A15 = 1 Y is the lower half (ext[11:0]) and X the upper (ext[4096 |
-//     11:0]).  The Falcon map (32K words, X/Y split by space) is gone.
+//     11:0]), in place of the Falcon's 32K-word map.
 //   - IRQB (vector P:$000A, level IPR[4:3]): a pulse on irqb latches it;
 //     taking it clears it (Previous auto-releases IRQB for the NeXT).  It
 //     ranks above the host interface at the same level.

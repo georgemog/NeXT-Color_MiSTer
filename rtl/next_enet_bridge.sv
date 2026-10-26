@@ -17,12 +17,10 @@
 //    +0x0018  RX_RPTR   FPGA increments per consumed frame
 //    +0x0020  GUEST_MAC bit63 = valid, bits[47:0] = station address
 //                       (FPGA republishes on NodeID writes)
-//    +0x0028  NET_MODE  bit63 = valid, bits[2:0] = the network mode Main's
-//                       daemon opens (0 off, 1 eth0, 2 eth1, 3 macvlan,
-//                       4 tap), the OSD's "Network interface" as latched at
-//                       the last reset.  "NXTETH02" says this word is there;
-//                       under "NXTETH01" (the mono NeXT core, older NeXT-Color
-//                       builds) Main reads the mode from status[54:52].
+//    +0x0028  NET_MODE  bit63 = valid, bits[2:0] = mode for Main's daemon
+//                       (0 off, 1 eth0, 2 eth1, 3 macvlan, 4 tap).  Only
+//                       under "NXTETH02"; with "NXTETH01" Main reads the
+//                       mode from status[54:52].
 //    +0x0800  TX slots: 4 x 2048 bytes
 //    +0x2800  RX slots: 4 x 2048 bytes
 //    slot: u64 header, bits[10:0] = length; frame bytes from +8,

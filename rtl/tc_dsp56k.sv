@@ -6,10 +6,9 @@
 //  apolkosnik/Falcon_MiSTer rtl/falcon/dsp, with the NeXT memory map, IRQB
 //  and start modes, and next_dsp_periph for the NeXT host bus).
 //
-//  This replaces rtl/tc_dsp.sv's link to Previous's interpreter on the ARM
-//  (NEXT_DSP_ARM in the qsf selects that one again).  The DSP runs one DSP
-//  clock per clk: 2 clocks per instruction cycle, 12.5 MIPS at the 25 MHz
-//  machine clock, a real 25 MHz 56001's rate.
+//  One DSP clock per clk, 2 per instruction cycle: 12.5 MIPS at 25 MHz, a
+//  real 25 MHz 56001.  (NEXT_DSP_ARM in the qsf selects rtl/tc_dsp.sv, the
+//  DSP on the ARM, instead.)
 //
 //  "dsp.c:n" / "dsp_core.c:n" / "sysReg.c:n" = Previous r1851 src/dsp and src.
 //
@@ -33,13 +32,10 @@
 //  counter starts at 4 - HM (24-bit: H M L; 16-bit: M L; 8-bit: L) or 4
 //  when unpacked (pad, H, M, L), and each byte goes to / comes from
 //  register TRXL - counter.  A request moves a byte in the channel's
-//  direction only: to the DSP on TXDE, from it on RXDF (tc_dsp.sv: with
-//  both TREQ and RREQ set Previous would also move stale RX words).  A byte
-//  from the DSP is read from the host port when requested; a byte to the
-//  DSP is written when the channel delivers it.
+//  direction only: to the DSP on TXDE, from it on RXDF (with TREQ and RREQ
+//  both set Previous also moves stale RX words).
 //
-//  The SSI / SCI have no connector on the MiSTer: the SSI slot link is tied
-//  off.
+//  No SSI / SCI connector: the SSI slot link is tied off.
 //
 //  Device port contract (tc_machine): stb 1-cycle, ack 1 clock later.
 //============================================================================

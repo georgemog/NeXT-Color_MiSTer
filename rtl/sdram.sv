@@ -262,10 +262,9 @@ always @(posedge clk) begin
 				cpbusy <= 0;
 			end
 			
-			// the paired refresh: rank 0 at the clock before, rank 1 here.
-			// Six idle clocks follow, so rank 1's next ACTIVE comes seven
-			// after its REFRESH (tRFC: 7 at 99 MHz, ~66 ns; five left it at
-			// six, which the chip model flags on every access above 64 MB)
+			// paired refresh: rank 0 the clock before, rank 1 here.  Six idle
+			// clocks follow, so rank 1's next ACTIVE is seven after its
+			// REFRESH (tRFC ~66 ns = 7 clocks at 99 MHz)
 			STATE_RFSH: begin
 				state         <= STATE_IDLE_6;
 				command       <= CMD_AUTO_REFRESH;

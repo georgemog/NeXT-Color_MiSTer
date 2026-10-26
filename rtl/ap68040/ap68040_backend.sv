@@ -2280,10 +2280,7 @@ always_ff @(posedge clk) begin
 			// youngest's: AG keeps waiting for it)
 			if (stale_b && ag_u.base_v) agb_q <= exq_val;
 			// (not when the load leaving DC2 is captured this cycle: it is
-			// younger than the EX writer, and reloading exq_val next cycle
-			// would put that older value back over it -- a JSR (An) took
-			// the previous MOVEA's address after a snoop freeze held the
-			// older MOVEA in EX until its successor caught up)
+			// younger than the EX writer, whose value would overwrite it)
 			stale_b <= exw_ag && ag_u.base_v && exw_reg == ag_u.base && !cap_b &&
 			           !(dc2_capd && dc2_u.d_reg == ag_u.base && adv_dc2);
 			if (dc2_capd && ag_u.base_v && dc2_u.d_reg == ag_u.base) begin

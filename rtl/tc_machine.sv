@@ -1,8 +1,8 @@
 //============================================================================
 //  tc_machine -- the NeXTstation Turbo Color: AP68040 on the TMC's 32-bit bus.
 //
-//  Structure from MacQuadra800_MiSTer rtl/quadra800.sv (the CPU bundle --
-//  now the pipelined AP68040 behind rtl/next_ap68040.sv --
+//  Structure from MacQuadra800_MiSTer rtl/quadra800.sv (the CPU bundle,
+//  here rtl/next_ap68040.sv;
 //  wombat_bus32, the service FSM, the platform beat port and its retained-
 //  line fast paths); the address map and every device are the Turbo
 //  Color's.  "HS n" = rom-dissassembly/hardware-summary.md section n.
@@ -122,10 +122,9 @@ module tc_machine
 	input             fsd_ack,
 	output      [7:0] fsd_buff_din,
 
-	// Ethernet: the OSD's network interface (connected = not None, and the
-	// mode Main's daemon opens, next_enet_bridge NET_MODE), and the bridge's
-	// mailbox port (one 64-bit DDR3 word at a time, clk_sys; tc_enet_ddr in
-	// the top)
+	// Ethernet: the OSD network interface (connected = not None; mode =
+	// next_enet_bridge NET_MODE), and the bridge's mailbox port (one 64-bit
+	// DDR3 word at a time, clk_sys; tc_enet_ddr in the top)
 	input             enet_connected,
 	input       [2:0] enet_mode,
 	output            enet_m_req,
@@ -309,9 +308,9 @@ reg         snoop_stb;        // a DMA write landed (service FSM below)
 reg  [31:2] snoop_line;
 wire        snoop_full;       // the CPU's snoop queue: hold DMA beats
 
-// DMA line flush (next_ap68040 SNOOP = 2): a DMA beat of a RAM line is
-// served only once that line has been flushed out of the 68040's caches
-// (and, if it was dirty, written back) since the core last read it
+// DMA line flush (next_ap68040 SNOOP = 2): a DMA beat of a RAM line waits
+// until the line is flushed from the 68040's caches (dirty: written back)
+// with no core read of it since
 reg         fl_req;           // one clock
 reg  [31:4] fl_addr;
 reg         fl_wait;          // asked, fl_done not yet seen
@@ -642,11 +641,10 @@ tc_enet enet (
 	.guest_mac(enet_mac)
 );
 
-// DSP56001 (Previous ioMemTabTurbo.c:130-137): rtl/tc_dsp56k.sv, the DSP in
-// the FPGA (rtl/dsp56k, from Falcon_MiSTer) behind the 68040's host port.
-// NEXT_DSP_ARM (qsf) selects rtl/tc_dsp.sv instead, the host port with the
-// DSP on the ARM (Main_MiSTer support/next/next_dsp.cpp) behind a DDR3
-// mailbox at $30400000.  NEXT_NO_DSP leaves the DSP out: its registers read 0.
+// DSP56001 (Previous ioMemTabTurbo.c:130-137): rtl/tc_dsp56k.sv, in the FPGA
+// (rtl/dsp56k, from Falcon_MiSTer).  NEXT_DSP_ARM (qsf): rtl/tc_dsp.sv, the
+// DSP on the ARM (Main_MiSTer support/next/next_dsp.cpp) via a DDR3 mailbox
+// at $30400000.  NEXT_NO_DSP: no DSP, its registers read 0.
 wire [31:0] dsp_rdata;  wire dsp_ack;
 wire        ds_m_req, ds_m_we;
 wire [28:0] ds_m_addr;
