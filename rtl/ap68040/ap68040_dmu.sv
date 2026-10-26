@@ -1953,10 +1953,8 @@ always_ff @(posedge clk) begin
 			vp_lwe = 1'b1; vp_lv = 1'b0; vp_dwe = 1'b1; vp_dv = 1'b0;
 		end
 		E_PUSHV_B: if (!pv_v) begin
-			// a snoop took the buffered victim while the engine was frozen
-			// here (an SC = 10 read supplies it and empties the buffer):
-			// nothing left to push -- pushing pv_line now would write a stale
-			// copy over memory the snooping master may already have changed
+			// a snoop (SC = 10 read) took the buffered victim while frozen
+			// here: pushing pv_line would write a stale copy over memory
 			e_st <= e_sret;
 		end
 		else begin

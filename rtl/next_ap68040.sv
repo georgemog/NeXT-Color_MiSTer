@@ -1,14 +1,9 @@
 //============================================================================
-//  next_ap68040 -- the AP68040 (github.com/apolkosnik/AP68040, the pipelined
-//  MC68040, branch ap68040-60mhz + the md_fin fix, as in Minimig-AGA's
-//  AP68040 build of 2026-10-14) on tc_machine's CPU transaction port.
-//
-//  Takes wombat_cpu's place: the transaction port below is the one
-//  wombat_bus32 and the service FSM's fast paths consume (wombat_cpu
-//  contract).  The MMU, both caches and the table walker are inside the
-//  core now and run over the 68040 bus like any other transfer, so the
-//  wombat walker port, the retained-line sideband and the store buffer are
-//  gone.  wombat_store_buffer stays: RAM and VRAM stores are posted.
+//  next_ap68040 -- the AP68040 (github.com/apolkosnik/AP68040, pipelined
+//  MC68040; rtl/ap68040/UPSTREAM.md) on tc_machine's CPU transaction port
+//  (the wombat_cpu contract wombat_bus32 and the service FSM consume).  The
+//  MMU, caches and table walker are inside the core and use the 68040 bus;
+//  wombat_store_buffer posts RAM and VRAM stores.
 //
 //  The 68040 bus (MC68040UM section 7), BCLK = PCLK = clk:
 //   - a transfer is latched on the clock TS is seen; the address and the
@@ -26,42 +21,34 @@
 //   - interrupt acknowledges (TT = 3, TM = level) end in TA + AVEC (the
 //     Turbo Color autovectors every level); any other CPU space access
 //     (breakpoint acknowledge) ends in TEA
-//   - TCI on reads of the device page $02xxxxxx (the ROM's ITT0/DTT0 make
-//     it non-cacheable too; this is the belt, as wombat_cpu's NOCACHE_PAGE)
+//   - TCI on reads of the device page $02xxxxxx (also non-cacheable by the
+//     ROM's ITT0/DTT0)
 //
-//  DMA coherency (SNOOP = 1).  wombat_cpu dropped the D-cache line of every DMA write
-//  (snoop_stb).  Here that is the 68040's own snooper: the line addresses
-//  wait in a small queue (consecutive beats of one line coalesce); when it
-//  is not empty BG is negated, the core gives the bus up at the end of its
-//  transfer, and each line is presented as an alternate master's long-word
-//  write with SC = 10 (any hit: invalidate, memory responds -- MC68040UM
-//  table 4-4).  TA is given once the snooper negates MI.  snoop_full asks
-//  tc_machine to hold DMA beats while the queue cannot take another line.
+//  DMA coherency, SNOOP = 1: DMA-written line addresses wait in a small
+//  queue (beats of one line coalesce); while it is not empty BG is negated,
+//  the core releases the bus after its transfer, and each line is presented
+//  as an alternate master's long-word write with SC = 10 (hit: invalidate,
+//  memory responds -- MC68040UM table 4-4).  TA once the snooper negates
+//  MI.  snoop_full holds tc_machine's DMA beats while the queue is full.
 //
-//  DMA coherency (SNOOP = 2, the default).  With the data cache in copyback
-//  a DMA read must see a dirty line and a DMA write must not be undone by
-//  one (SC = 10 writes invalidate a dirty line: its other bytes are lost).
-//  So before tc_machine serves a DMA beat of a RAM line it asks for that
-//  line to be flushed (fl_req, one clock): the core gives the bus up and
-//  the line is presented as an alternate master's line read with SC = 10
-//  (MC68040UM table 4-4: a dirty hit is supplied by the 68040 -- MI stays
-//  asserted, the core drives TA and the four long words -- then
-//  invalidated; a clean hit is invalidated; memory answers otherwise).
-//  fl_done reports the line, fl_dirty whether it was supplied (tc_machine
-//  writes it to RAM before the beat).  fill_stb/fill_line report every
-//  line read the core starts, so tc_machine knows when a flushed line may
-//  be cached again.
+//  DMA coherency, SNOOP = 2 (default), for the copyback data cache: a DMA
+//  read must see a dirty line, and a DMA write must not be undone by one
+//  (an SC = 10 write invalidates a dirty line, losing its other bytes).
+//  Before a DMA beat of a RAM line tc_machine asks for a flush (fl_req, one
+//  clock): the line is presented as an alternate master's line read with
+//  SC = 10 (table 4-4: a dirty hit is supplied by the 68040 -- MI asserted,
+//  the core drives TA and four long words -- then invalidated; a clean hit
+//  is invalidated; otherwise memory answers).  fl_done ends it, fl_dirty
+//  says fl_line was supplied (tc_machine writes it to RAM before the beat).
+//  fill_stb/fill_line report each line read the core starts: the flushed
+//  line may be cached again.
 //
-//  SNOOP = 0 leaves the snoop queue empty (DMA coherency is then the
-//  drivers').  It was tc_machine's setting until the AP68040 fix for a load
-//  answered with a discarded slow-path job's data during a snoop freeze
-//  (upstream PR #10): NeXTSTEP read a pushed argument as $1112400C, the
-//  wrong-path load's value, and panicked ("illegal instruction").
+//  SNOOP = 0: no snooping (DMA coherency is the drivers').
 //
-//  ce must be 1 (the NeXT-Color top ties it high, as for wombat_cpu).
+//  ce must be 1.
 //
-//  NEXT_A040_TRACE (sim only, verilator/Makefile V_DEFINE): a stall watchdog
-//  and the traces used to find the two core bugs above.
+//  NEXT_A040_TRACE (sim only, verilator/Makefile V_DEFINE): stall watchdog
+//  and debug traces.
 //============================================================================
 
 module next_ap68040
@@ -123,15 +110,12 @@ module next_ap68040
 localparam [1:0] SIZ_L = 2'b00, SIZ_B = 2'b01, SIZ_W = 2'b10, SIZ_LINE = 2'b11;
 
 //----------------------------------------------------------------------------
-// clocks (CPU2X).  The core runs on clk_cpu, twice clk with aligned edges;
-// its bus clock enable bclk_en is high in the clk_cpu cycles that end on a
-// clk edge (BCLK = PCLK / 2, MC68040UM 7.1).  Everything else in this module
-// -- the transfer FSM, the store buffer, the snoop presenter -- runs on
+// clocks (CPU2X).  The core runs on clk_cpu = 2 x clk, aligned edges; its
+// bus clock enable bclk_en is high in the clk_cpu cycles ending on a clk
+// edge (BCLK = PCLK / 2, MC68040UM 7.1).  The rest of this module runs on
 // clk_cpu under the same enable, so every port to tc_machine changes and is
-// sampled only on clk edges: to tc_machine this is the 33 MHz CPU it was.
-// The paths between these registers and clk are two clk_cpu cycles
-// (NeXT-Color.sdc).  ipl and nreset are registered on an enabled edge before
-// they reach the core.
+// sampled only on clk edges; those paths are two clk_cpu cycles
+// (NeXT-Color.sdc).  ipl and nreset are registered on an enabled edge.
 //----------------------------------------------------------------------------
 wire pclk = CPU2X ? clk_cpu : clk;
 reg  bclk_en = 1'b1;
@@ -179,9 +163,8 @@ reg         alt_ln;
 ap68040 #(
 	.FPU_REVISION(FPU_REVISION),
 	.FPU_PIPE(FPU_PIPE), .LOOP_PRED(LOOP_PRED), .EARLY_RES(EARLY_RES),
-	// copyback: the core's write-through stores run through the DMU
-	// engine one at a time (~2.9x Dhrystone).  DMA reads are not snooped
-	// (hardware boot loops 2026-10-19: copyback 3/4, write-through 6/6)
+	// copyback (~2.9x write-through's Dhrystone: those stores run through
+	// the DMU engine one at a time); coherent through SNOOP = 2
 	.DC_WRITETHROUGH(0)
 ) cpu (
 	.clk(pclk), .bclk_en(bclk_en), .rsti_n(nrst_q),

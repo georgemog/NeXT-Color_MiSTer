@@ -18,15 +18,12 @@
 //  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 //
 //  Clocks (structure from MacQuadra800_MiSTer, MacQuadra800.sv):
-//    clk_sys  25.000 MHz  the CPU bus, devices (the real Turbo bus is 33 MHz:
-//                         this one is set by clk_cpu, see below; CLK_HZ
+//    clk_sys  25.000 MHz  CPU bus, devices (real Turbo bus: 33 MHz; CLK_HZ
 //                         keeps the devices' real-time rates)
 //    clk_ram  75.000 MHz  SDRAM controller, exactly 3 x clk_sys (same PLL)
-//    clk_cpu  50.000 MHz  the AP68040 core, 2 x clk_sys (same PLL; its bus
-//                         runs at clk_sys, rtl/next_ap68040.sv).  With the
-//                         DSP56001 in the FPGA (~95% full) 57 MHz did not
-//                         close on six seeds, so the whole PLL sits 24%
-//                         below the 33/99 MHz it had.
+//    clk_cpu  50.000 MHz  AP68040 core, 2 x clk_sys (same PLL; its bus runs
+//                         at clk_sys, rtl/next_ap68040.sv).  Sets the PLL:
+//                         ~95% full with the DSP, 57 MHz does not close.
 //    clk_vid 100.000 MHz  pixel clock, own PLL (rtl/pll_vid.v)
 //
 //  Memory (docs/DECISIONS.md):
@@ -73,13 +70,10 @@ assign BUTTONS = 0;
 localparam CONF_STR = {
 	"NeXT-Color;;",
 	"-;",
-	// The menu follows the MiSTer OSD standard (danifunker/hp9000-715_MiSTer
-	// docs/osd-standard.md): the media and Load ROM, then Memory and the
-	// network, then the pages (P1 Machine, P2 Video, P3 Input, P5 Advanced),
-	// then "Changes pending" and "Apply and reset".  Every setting outside
-	// the media, Input and the P1 buttons is taken at the next reset (cfg
-	// below).  Rows keep their status bits when they move, so saved settings
-	// stay valid ("v,1").
+	// MiSTer OSD standard (danifunker/hp9000-715_MiSTer docs/osd-standard.md).
+	// Settings other than the media, Input and the P1 buttons take effect at
+	// the next reset (cfg below).  Rows keep their status bits, so saved
+	// settings stay valid.
 	//
 	// SC slots: Main remembers the mounted image in config/NeXT-Color.s<n>
 	// and re-mounts it at core start, so the ROM can boot from the disk.
@@ -96,16 +90,14 @@ localparam CONF_STR = {
 	"F1,ROMBIN,Load ROM;",
 	"-;",
 	// The first entry is the default.  32 MB fits every SDRAM module; a
-	// larger choice runs as the module's size (ram_cfg below).  "v,1" dropped
-	// the settings saved with the old order (64 MB, Prompt, Normal first).
+	// larger choice is capped at the module's size (mem_rank below).  "v,1"
+	// drops settings saved with the old order (64 MB, Prompt, Normal first).
 	"O[4:3],Memory,32MB,64MB,128MB,16MB;",
-	// Network interface: latched (cfg) and published to Main's next_enet
-	// daemon in the bridge's mailbox (NET_MODE, magic "NXTETH02",
-	// rtl/next_enet_bridge.sv), so it too waits for Apply and reset.  None
-	// unplugs the cable (rtl/tc_enet.sv).  No wlan0: Main's bridge has none.
-	// Bit 52 was the old "Ethernet,Disconnected,Connected" switch and bits
-	// 53:54 are Main's status mode for the mono NeXT core (NXTETH01): never
-	// reuse them.  Every saved v,1 setting reads 0 here = eth0.
+	// Network interface: latched (cfg), passed to Main's next_enet daemon as
+	// NET_MODE (rtl/next_enet_bridge.sv).  None unplugs the cable
+	// (rtl/tc_enet.sv).  No wlan0: Main's bridge has none.  Bits 54:52 are
+	// the old Ethernet switch and Main's mono-core status mode: never reuse.
+	// Older saved settings read 0 = eth0.
 	"O[57:55],Network interface,eth0,None,eth1,macvlan,tap0;",
 	"-;",
 	"P1,Machine;",
@@ -116,8 +108,8 @@ localparam CONF_STR = {
 	"h0-,Changes pending;",
 	"R[0],Apply and reset;",
 
-	// buttons (status pulses while held): the NeXT power key (the
-	// power-off panel, as F10) and the NMI (the ROM monitor, as F11)
+	// buttons (status pulses while held): power key (as F10), NMI (ROM
+	// monitor, as F11)
 	"P1T[10],Power key;",
 	"P1T[11],NMI (monitor);",
 
@@ -276,14 +268,10 @@ always @(posedge clk_sys) begin
 	reset        <= config_reset | (kms_reset_cnt != 0);
 end
 
-// The settings the machine runs with: the OSD's values, taken while the
-// machine is in configuration reset (Apply and reset, the board's button, a
-// core start or a ROM load), so a change waits for the next reset and the
-// ROM never sees one under it (the MacQuadra800 lesson; the OSD standard's
-// rule 1).  The media, Input and the P1 buttons act at once and stay out of
-// it.  The KMS magic reset (Win+Alt+keypad *) keeps the running settings,
-// as it keeps the NVRAM.  "Changes pending" (status_menumask bit 0, the
-// h0 row) shows while a latched field differs from the running one.
+// The settings the machine runs with, latched in configuration reset (Apply
+// and reset, the board button, core start, ROM load) so the ROM never sees
+// one change.  The KMS magic reset keeps them, as it keeps the NVRAM.
+// cfg_pending ("Changes pending", menumask bit 0): a latched field differs.
 reg [125:0] cfg = 126'd0;
 always @(posedge clk_sys) if (config_reset) cfg <= status[125:0];
 assign cfg_pending = {status[8:3], status[57:55], status[125:121]} !=
@@ -301,12 +289,10 @@ always @(*) case (cfg[57:55])
 endcase
 wire net_connected = (net_mode != 3'd0);
 
-// Memory, no larger than the SDRAM module.  Sizes as ranks: 0 = 16 MB,
-// 1 = 32, 2 = 64, 3 = 128; the OSD order 32, 64, 128, 16 MB is rank - 1.
-// sdram_sz[15] says Main knows the module, [1:0] 1 = 32 MB, 2 = 64 MB,
-// 3 = 128 MB (sys/hps_io.sv, Main's sdram_sz()).  An unknown module (Main
-// never sent it) leaves the choice alone, as before.  A choice above the
-// module used to make NeXTSTEP panic; now it runs as the module's size.
+// Memory, capped at the SDRAM module (more makes NeXTSTEP panic).  Ranks:
+// 0 = 16 MB, 1 = 32, 2 = 64, 3 = 128; OSD order 32, 64, 128, 16 MB is
+// rank - 1.  sdram_sz[15] = module known, [1:0] 1/2/3 = 32/64/128 MB
+// (sys/hps_io.sv); an unknown module is not capped.
 wire [1:0] mem_want = status[4:3] + 2'd1;
 wire [1:0] mem_max  = !sdram_sz[15]          ? 2'd3 :
                       (sdram_sz[1:0] == 2'd0) ? 2'd1 : sdram_sz[1:0];
@@ -335,11 +321,8 @@ always @(posedge clk_sys) osd_btn_d <= status[11:10];
 wire osd_power = status[10] & ~osd_btn_d[10];
 wire osd_nmi   = status[11] & ~osd_btn_d[11];
 
-// Input: Swap Alt/Win keys (status[9], at once).  The Win keys are the
-// NeXT's Command keys and Alt its Alternate keys (rtl/tc_kms.sv); with the
-// swap, left Alt <-> left GUI and right Alt <-> right GUI (ps2_key [8] =
-// extended, [7:0] = the set-2 code).  The magic reset (L-Win + L-Alt +
-// keypad *) still works because both keys swap.
+// Input: Swap Alt/Win keys (status[9], at once).  Win = NeXT Command, Alt =
+// Alternate (rtl/tc_kms.sv).  ps2_key [8] = extended, [7:0] = set-2 code.
 function automatic [8:0] alt_win(input [8:0] k);
 	case (k)
 		9'h011: alt_win = 9'h11F;   // left Alt -> left GUI
@@ -608,7 +591,7 @@ assign VGA_VS = ~vga_vs;
 // 35:26, square pixels (the mono core's lesson: a 4:3 declaration squeezes
 // 1120 columns into 1109).  "Normal" scale fills the output height with the
 // right aspect: 1454x1080 on 1080p, 969x720 on 720p.
-// Both are latched settings (cfg): they change at Apply and reset.
+// Both latched (cfg).
 wire [1:0] ar = cfg[122:121];
 // OSD order V-Integer, Normal, ... -> video_freak's 1, 0, 2, 3
 wire [2:0] scale = (cfg[125:123] == 3'd0) ? 3'd1 :
