@@ -71,7 +71,14 @@ module z8530_scc #(
     // NeXT: WR2 and WR9 are chip-wide on the real Z8530 and the NeXT ROM and
     // drivers may write them through either channel. 0 keeps the Lisa
     // behaviour (channel-B writes to WR2/WR9 are dropped).
-    parameter SHARED_WR2_WR9_B = 0
+    parameter SHARED_WR2_WR9_B = 0,
+    // Datasheet interrupt-pending semantics (NeXT): TxIP is set only while
+    // WR1 TxIE is on and is cleared by a data write as well as by WR0 Reset
+    // Tx IP; RR3 shows only enabled IP bits. NeXTSTEP's _zsint loops on RR3
+    // until it reads 0 and its TX handler leaves without Reset Tx IP once the
+    // buffer is full, relying on the data write -- with the Lisa semantics
+    // (0) it spins at interrupt level for as long as the transmitter runs.
+    parameter IP_DATASHEET = 0
 ) (
     // System Interface
     input  wire        clk,           // CPU/bus clock (register file, interrupts, RR mux)
@@ -1470,7 +1477,15 @@ assign rr2_b = status_high
                : {wr2_a[7:4], int_status, wr2_a[0]};
 
 // RR3 - Interrupt Pending (Channel A only)
-assign rr3_a = {
+assign rr3_a = (IP_DATASHEET != 0) ? {
+    2'b00,
+    rx_int_active_a,
+    tx_int_active_a,
+    ext_int_active_a,
+    rx_int_active_b,
+    tx_int_active_b,
+    ext_int_active_b
+} : {
     2'b00,
     rx_int_pend_a,
     tx_int_pend_a,
@@ -1587,15 +1602,30 @@ always @(posedge clk or negedge reset_n) begin
 
         // TX int (IP): latched on TX FSM byte-grab regardless of WR1[1];
         // cleared only by WR0 cmd 101 (Reset TX Int Pending).
-        if (reset_tx_int_cmd_a)
-            tx_int_pend_a <= 1'b0;
-        else if (tx_byte_grab_pulse_a)
-            tx_int_pend_a <= 1'b1;
+        // IP_DATASHEET: a data write also clears TxIP, a byte grab sets it
+        // only with TxIE on, and a grab in the same clock as a write wins
+        // (a spare interrupt finds TBE and returns; a lost one stalls TX).
+        if (IP_DATASHEET != 0) begin
+            if (tx_byte_grab_pulse_a && wr1_a[1])
+                tx_int_pend_a <= 1'b1;
+            else if (reset_tx_int_cmd_a || tx_fifo_wen_a)
+                tx_int_pend_a <= 1'b0;
 
-        if (reset_tx_int_cmd_b)
-            tx_int_pend_b <= 1'b0;
-        else if (tx_byte_grab_pulse_b)
-            tx_int_pend_b <= 1'b1;
+            if (tx_byte_grab_pulse_b && wr1_b[1])
+                tx_int_pend_b <= 1'b1;
+            else if (reset_tx_int_cmd_b || tx_fifo_wen_b)
+                tx_int_pend_b <= 1'b0;
+        end else begin
+            if (reset_tx_int_cmd_a)
+                tx_int_pend_a <= 1'b0;
+            else if (tx_byte_grab_pulse_a)
+                tx_int_pend_a <= 1'b1;
+
+            if (reset_tx_int_cmd_b)
+                tx_int_pend_b <= 1'b0;
+            else if (tx_byte_grab_pulse_b)
+                tx_int_pend_b <= 1'b1;
+        end
 
         // Ext/Status int (IP): latched on any WR15-enabled CTS/DCD edge
         // regardless of WR1[0]; cleared only by WR0 cmd 010.
