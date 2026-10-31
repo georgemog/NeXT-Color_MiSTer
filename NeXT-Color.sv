@@ -43,7 +43,9 @@ module emu
 
 assign ADC_BUS  = 'Z;
 assign USER_OUT = '1;
-assign {UART_RTS, UART_TXD, UART_DTR} = 0;
+// serial port A (tc_scc, Z8530 channel A) on the MiSTer UART: TXD/RXD only,
+// the SCC sees CTS/DCD asserted.
+assign {UART_RTS, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
 assign VGA_SL = 0;
@@ -440,6 +442,9 @@ tc_machine #(.CLK_HZ(CLK_SYS_HZ)) machine
 	.enet_m_wdata(enet_m_wdata),
 	.enet_m_rdata(enet_m_rdata),
 	.enet_m_ack(enet_m_ack),
+
+	.scc_txd_a(UART_TXD),
+	.scc_rxd_a(UART_RXD),
 
 	.led(led),
 	.reset_req(reset_req),

@@ -64,6 +64,7 @@ V_SRC = \
 	$(RTL)/tc_kms.sv \
 	$(RTL)/next_sound_output.sv \
 	$(RTL)/tc_enet.sv \
+	$(RTL)/z8530_scc.sv \
 	$(RTL)/tc_scc.sv \
 	$(RTL)/tc_tdma.sv \
 	$(RTL)/tc_dsp.sv \

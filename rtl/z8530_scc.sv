@@ -64,7 +64,14 @@ module z8530_scc #(
     //   rate is sclk/ClockMode. Set to 0 to compile the override out (that WR11
     //   encoding then selects the RTxC pin, which is tied off -> dead engine).
     parameter RTXC_XTAL_FULLRATE_A = 1,
-    parameter RTXC_XTAL_FULLRATE_B = 1
+    parameter RTXC_XTAL_FULLRATE_B = 1,
+    // NeXT: select each channel's BRG/serial strobe at run time from WR14[1]
+    // (BR generator source: 1 = PCLK, 0 = RTxC) instead of BRG_SRC_A/B.
+    parameter BRG_SRC_RUNTIME = 0,
+    // NeXT: WR2 and WR9 are chip-wide on the real Z8530 and the NeXT ROM and
+    // drivers may write them through either channel. 0 keeps the Lisa
+    // behaviour (channel-B writes to WR2/WR9 are dropped).
+    parameter SHARED_WR2_WR9_B = 0
 ) (
     // System Interface
     input  wire        clk,           // CPU/bus clock (register file, interrupts, RR mux)
@@ -72,6 +79,8 @@ module z8530_scc #(
     input  wire        sclk,          // Primary BRG/serializer clock (e.g. 3.6864 MHz)
     input  wire        pclk_en,       // Ch-A serial-domain enable strobe (~3.9 MHz); gates the pclk-sourced BRG
     input  wire        sclk_en,       // Ch-B serial-domain enable strobe (3.6864 MHz); gates the sclk-sourced BRG
+    input  wire        rtxca_en,      // BRG_SRC_RUNTIME: Ch-A RTxC strobe (WR14[1]=0)
+    input  wire        rtxcb_en,      // BRG_SRC_RUNTIME: Ch-B RTxC strobe (WR14[1]=0)
     input  wire        reset_n,       // Active low reset (async assert)
 
     // CPU Interface
@@ -295,8 +304,13 @@ wire sclk_b = (BRG_SRC_B != 0) ? sclk : pclk;
 // Single-clock + enable conversion: every sclk-domain block below now runs on
 // `clk` (== clk_sys) and advances only on these strobes, so the BRG counts at
 // the true 3.6864/3.9 MHz average instead of 81.5 MHz. Mirrors the BRG_SRC mux.
-wire sclk_a_en = (BRG_SRC_A != 0) ? sclk_en : pclk_en;
-wire sclk_b_en = (BRG_SRC_B != 0) ? sclk_en : pclk_en;
+// BRG_SRC_RUNTIME: WR14[1] picks the source at run time, as on the real chip
+// (1 = PCLK via pclk_en, 0 = the channel's RTxC via rtxca_en/rtxcb_en). With
+// strobes instead of clocks the switch is a plain mux, no clock glitch.
+wire sclk_a_en = (BRG_SRC_RUNTIME != 0) ? (wr14_a[1] ? pclk_en : rtxca_en) :
+                 (BRG_SRC_A != 0) ? sclk_en : pclk_en;
+wire sclk_b_en = (BRG_SRC_RUNTIME != 0) ? (wr14_b[1] ? pclk_en : rtxcb_en) :
+                 (BRG_SRC_B != 0) ? sclk_en : pclk_en;
 
 reg [1:0] sreset_a_sync, sreset_b_sync;
 always @(posedge clk or negedge reset_n) begin
@@ -1705,12 +1719,14 @@ always @(posedge clk or negedge reset_n) begin
                     // Z8530: writable through either channel. Stored as the
                     // _a copies; channel-B writes land in the same regs.
                     //@4'd2: begin wr2_a <= data_in; reg_ptr_b <= 4'd0; end
+                    4'd2: begin if (SHARED_WR2_WR9_B != 0) wr2_a <= data_in; reg_ptr_b <= 4'd0; end
                     4'd3: begin wr3_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd4: begin wr4_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd5: begin wr5_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd6: begin wr6_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd7: begin wr7_b <= data_in; reg_ptr_b <= 4'd0; end
                     //@4'd9: begin wr9_a <= data_in; reg_ptr_b <= 4'd0; end   // shared master-int-ctrl
+                    4'd9: begin if (SHARED_WR2_WR9_B != 0) wr9_a <= data_in; reg_ptr_b <= 4'd0; end
                     4'd10: begin wr10_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd11: begin wr11_b <= data_in; reg_ptr_b <= 4'd0; end
                     4'd12: begin wr12_b <= data_in; reg_ptr_b <= 4'd0; end

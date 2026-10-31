@@ -134,6 +134,10 @@ module tc_machine
 	input      [63:0] enet_m_rdata,
 	input             enet_m_ack,
 
+	// serial port A (tc_scc channel A): the MiSTer UART
+	output            scc_txd_a,
+	input             scc_rxd_a,
+
 	output            led,
 	output            reset_req,          // KMS magic reset: the top resets the machine
 
@@ -419,6 +423,7 @@ wire  [7:0] dd_wdata, dd_rdata;
 
 // interrupt sources (levels), Previous sysReg.h bit names (includes/sysReg.h:24-55)
 wire        int_power, int_keymouse, int_timer, int_video, int_tmc_nmi, int_kms_nmi;
+wire        int_scc;
 wire        int_scsi, int_scsi_dma, int_snd_out_dma, int_snd_in_dma, int_printer_dma,
             int_dsp_dma, int_en_tx_dma, int_en_rx_dma, int_en_tx, int_en_rx;
 // the floppy (next_floppy, below) and its share of the SCSI DMA channel
@@ -440,7 +445,9 @@ wire [31:0] int_src = {int_tmc_nmi | int_kms_nmi,  // 31 INT_NMI
                        int_snd_in_dma,             // 22 INT_SND_IN_DMA
                        1'b0,                       // 21 INT_SCC_DMA
                        int_dsp_dma,                // 20 INT_DSP_DMA
-                       5'd0,                       // 19..15
+                       2'd0,                       // 19..18
+                       int_scc,                    // 17 INT_SCC (tc_scc: Z8530 /INT)
+                       2'd0,                       // 16..15
                        int_dsp,                    // 14 INT_DSP_L4 (tc_dsp: HREQ / TXD)
                        int_video,                  // 13 INT_DISK = TMC video / ADB
                        int_scsi,                   // 12 INT_SCSI (tc_scsi: ENABLE_INT & STAT_INT)
@@ -711,7 +718,8 @@ tc_scc scc (
 	.clk(clk), .reset(dev_rst),
 	.stb(io_stb && io_dev == D_SCC && !io_tmc), .we(io_we),
 	.a2(io_addr[2]), .be(io_be), .wdata(io_wdata),
-	.rdata(scc_rdata), .ack(scc_ack));
+	.rdata(scc_rdata), .ack(scc_ack),
+	.irq(int_scc), .txd_a(scc_txd_a), .rxd_a(scc_rxd_a));
 
 // Floppy: the Intel 82077 + the NeXT external control register at
 // $02014100..$02014108 (HS 10; Previous floppy.c, ioMemTabTurbo.c:197-208):
