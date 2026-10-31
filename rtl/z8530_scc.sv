@@ -78,7 +78,14 @@ module z8530_scc #(
     // until it reads 0 and its TX handler leaves without Reset Tx IP once the
     // buffer is full, relying on the data write -- with the Lisa semantics
     // (0) it spins at interrupt level for as long as the transmitter runs.
-    parameter IP_DATASHEET = 0
+    parameter IP_DATASHEET = 0,
+    // Datasheet transmitter (NeXT): RR0 TBE means the transmit buffer is
+    // empty (the chip has one byte of buffer, not a 4-byte FIFO), and a
+    // character in progress is completed when WR5 TxEnable drops instead of
+    // freezing the line mid-bit. NeXTSTEP's zsparam waits about one buffered
+    // character's time for All Sent, then clears TxEnable while it rewrites
+    // WR3/WR4/WR5; with the Lisa FIFO (0) that cuts characters in half.
+    parameter TX_DATASHEET = 0
 ) (
     // System Interface
     input  wire        clk,           // CPU/bus clock (register file, interrupts, RR mux)
@@ -747,7 +754,7 @@ always @(posedge clk or negedge sreset_n_a) begin
         tx_fifo_ren_a_s       <= 1'b0;
     end else begin
         tx_fifo_ren_a_s <= 1'b0;  // default: not reading FIFO this cycle
-        if (tx_clk_a_s && tx_enable_a_s) begin
+        if (tx_clk_a_s && (tx_enable_a_s || (TX_DATASHEET != 0 && tx_state_a != TX_IDLE))) begin
             case (tx_state_a)
                 TX_IDLE: begin
                     tx_out_a        <= 1'b1;
@@ -853,7 +860,7 @@ always @(posedge clk or negedge sreset_n_b) begin
         tx_fifo_ren_b_s       <= 1'b0;
     end else begin
         tx_fifo_ren_b_s <= 1'b0;
-        if (tx_clk_b_s && tx_enable_b_s) begin
+        if (tx_clk_b_s && (tx_enable_b_s || (TX_DATASHEET != 0 && tx_state_b != TX_IDLE))) begin
             case (tx_state_b)
                 TX_IDLE: begin
                     tx_out_b        <= 1'b1;
@@ -1362,8 +1369,8 @@ wire tx_byte_grab_pulse_b = tx_byte_grab_b_sync[2] ^ tx_byte_grab_b_sync[1];
 wire rx_avail_clk_a  = ~rx_fifo_rempty_a;
 wire rx_avail_clk_b  = ~rx_fifo_rempty_b;
 // "TX Buffer Empty" in real Z8530 means CPU has room to write -> not full
-wire tx_room_clk_a   = ~tx_fifo_wfull_a;
-wire tx_room_clk_b   = ~tx_fifo_wfull_b;
+wire tx_room_clk_a   = (TX_DATASHEET != 0) ? tx_fifo_wempty_a : ~tx_fifo_wfull_a;
+wire tx_room_clk_b   = (TX_DATASHEET != 0) ? tx_fifo_wempty_b : ~tx_fifo_wfull_b;
 // True "all bytes drained" for RR1[0] "All Sent"
 wire tx_all_sent_a   = tx_fifo_wempty_a & ~tx_active_a_c;
 wire tx_all_sent_b   = tx_fifo_wempty_b & ~tx_active_b_c;

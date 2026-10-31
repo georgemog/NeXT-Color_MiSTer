@@ -139,7 +139,8 @@ z8530_scc #(
 	.RTXC_XTAL_FULLRATE_B(1),
 	.BRG_SRC_RUNTIME(1),
 	.SHARED_WR2_WR9_B(1),
-	.IP_DATASHEET(1)
+	.IP_DATASHEET(1),
+	.TX_DATASHEET(1)
 ) scc (
 	.clk(clk), .pclk(clk), .sclk(clk),
 	.pclk_en(en_3684), .sclk_en(en_3684),

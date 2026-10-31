@@ -5,7 +5,8 @@
 //     loopback, x16, BRG from RTxC, TC $0A), RR0 TX-empty, data $40 on each
 //     channel, RR0 RX-available, data read back == $40.
 //  2. scc_init_channel at 9600 baud from PCLK (WR14 $03): a character on
-//     channel A's TXD (the MiSTer UART) with the right bit time.
+//     channel A's TXD (the MiSTer UART) with the right bit time; a second
+//     one survives WR5 TxEnable being cleared halfway through it.
 //  3. A character driven into RXD A arrives in RR8 and raises INT_SCC with
 //     WR1 RX-interrupt-on-all and WR9 MIE.
 `timescale 1ns/1ps
@@ -174,6 +175,17 @@ initial begin
 	fork
 		expect_tx(8'h4e, 9600.0);
 		wr(3'd3, 8'h4e);
+	join
+	// WR5 TxEnable dropped mid-character (zsparam): the character completes
+	fork
+		expect_tx(8'hb5, 9600.0);
+		begin
+			wr(3'd3, 8'hb5);
+			delay_us(450);                     // ~4 bits in
+			wr(3'd1, 8'h05); wr(3'd1, 8'h60);  // TxEnable off
+			delay_us(3000);
+			wr(3'd1, 8'h05); wr(3'd1, 8'hea);  // back on
+		end
 	join
 
 	// --- 3. RX from the UART, interrupt -------------------------------
