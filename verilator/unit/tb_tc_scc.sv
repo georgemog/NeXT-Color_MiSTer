@@ -9,6 +9,8 @@
 //     one survives WR5 TxEnable being cleared halfway through it.
 //  3. A character driven into RXD A arrives in RR8 and raises INT_SCC with
 //     WR1 RX-interrupt-on-all and WR9 MIE.
+//  4. MIDI as NeXTSTEP sets it up (clock select $30 = RTxC 10 MHz, TC 8,
+//     x16): 31250 baud out and in, channel A, then channel B via uart_b.
 `timescale 1ns/1ps
 module tb_tc_scc;
 
@@ -24,12 +26,13 @@ reg  [31:0] wdata = 0;
 wire [31:0] rdata;
 wire        ack, irq, txd_a;
 reg         rxd_a = 1;
+reg         uart_b = 0;      // tc_scc: port B on the UART
 
 tc_scc #(.CLK_HZ(CLK_HZ)) dut (
 	.clk(clk), .reset(reset),
 	.stb(stb), .we(we), .a2(a2), .be(be), .wdata(wdata),
 	.rdata(rdata), .ack(ack),
-	.irq(irq), .txd_a(txd_a), .rxd_a(rxd_a));
+	.irq(irq), .uart_b(uart_b), .txd(txd_a), .rxd(rxd_a));
 
 integer errors = 0;
 
@@ -121,7 +124,7 @@ task automatic expect_tx(input [7:0] c, input real baud);
 		end
 		if (txd_a !== 1'b1) begin $display("FAIL TX: no stop bit"); errors++; end
 		if (got !== c) begin $display("FAIL TX: got %02x want %02x", got, c); errors++; end
-		else $display("ok   TX ch A $%02x at %0.0f baud", got, baud);
+		else $display("ok   TX on UART $%02x at %0.0f baud", got, baud);
 	end
 endtask
 
@@ -210,6 +213,45 @@ initial begin
 	delay_us(20);
 	if (irq) begin $display("FAIL INT: WR9 written via channel B did not clear MIE"); errors++; end
 	else $display("ok   WR9 shared through channel B");
+
+	// --- 4. MIDI (NeXTSTEP mididriver deviceInit + kernel _zsintsetup/_zs_tc):
+	// clock select $30 = RTxC 10 MHz, BRG from RTxC (WR14 $00|1), TC 8, x16
+	// -> 10e6 / (2 * 16 * (8 + 2)) = 31250 baud; on channel A, then channel B
+	// with uart_b (MIDI unit 1).
+	wr(3'd4, 8'h30);
+	wr(3'd1, 8'h09); wr(3'd1, 8'hc0); delay_us(10);
+	for (i = 0; i < 2; i = i + 1) begin : midi_ch
+		reg [2:0] c, d;
+		c = i ? 3'd0 : 3'd1;                   // ctrl B / ctrl A
+		d = i ? 3'd2 : 3'd3;                   // data B / data A
+		uart_b = (i == 1);
+		wr(c, 8'h0b); wr(c, 8'h50);
+		wr(c, 8'h04); wr(c, 8'h44);
+		wr(c, 8'h03); wr(c, 8'hc0);
+		wr(c, 8'h05); wr(c, 8'he2);
+		wr(c, 8'h0e); wr(c, 8'h00);
+		wr(c, 8'h0c); wr(c, 8'h08);
+		wr(c, 8'h0d); wr(c, 8'h00);
+		wr(c, 8'h0e); wr(c, 8'h00);
+		wr(c, 8'h0e); wr(c, 8'h01);
+		wr(c, 8'h03); wr(c, 8'hc1);
+		wr(c, 8'h05); wr(c, 8'h6a);
+		fork
+			expect_tx(i ? 8'h91 : 8'h90, 31250.0);
+			wr(d, i ? 8'h91 : 8'h90);
+		join
+		// and a MIDI byte in on the same port
+		fork
+			send_rx(8'h3c, 31250.0);
+		join
+		delay_us(100);
+		wr(c, 8'h00); rd(c, q);
+		if (!q[0]) begin $display("FAIL MIDI ch%s: no RX", i ? "B" : "A"); errors++; end
+		rd(d, q);
+		if (q !== 8'h3c) begin $display("FAIL MIDI ch%s RX: got %02x want 3c", i ? "B" : "A", q); errors++; end
+		else $display("ok   MIDI ch%s RX $3c at 31250 baud", i ? "B" : "A");
+	end
+	uart_b = 0;
 
 	if (errors == 0) $display("PASS tb_tc_scc");
 	else $display("FAIL tb_tc_scc: %0d error(s)", errors);

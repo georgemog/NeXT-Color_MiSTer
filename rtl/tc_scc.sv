@@ -14,11 +14,14 @@
 //  +3 = be[0].  The ROM uses byte accesses; with several lanes the lowest
 //  address wins.
 //
-//  Clocks (Previous scc.c PCLK_HZ / RTXC_HZ and the clock select bits):
+//  Clocks (the byte at +4, lane 3; Previous scc.c scc_clock_write):
 //    PCLK   3.6864 MHz (WR14[1] = 1 takes the BRG from here)
-//    RTxC A 4 MHz when clock select bit 1 (SCLKA_4_MHZ) is set, else 3.6864
-//    RTxC B 4 MHz when clock select bit 3 (SCLKB_4_MHZ) is set, else 3.6864
-//  (the bits of the byte at +4, lane 3: the ROM's move.b #$0A sets both).
+//    RTxC   bits 5:4 (Turbo "system clock"): 0 = 3.6864, 1/2 = 4, 3 = 10 MHz.
+//           NeXTSTEP 3.3's _zsintsetup ($0401a448) writes $30 on a Turbo and
+//           its _zs_tc ($04099b24) then counts RTxC as 10 MHz -- MIDI's 31250
+//           baud is TC 8 from it, which 3.6864 MHz cannot make.
+//           With bits 5:4 = 0, bit 1 (SCLKA_4_MHZ) / bit 3 (SCLKB_4_MHZ) give
+//           channel A / B 4 MHz: the ROM's scc_calc_baud_tc writes $0A.
 //  all as clk strobes from phase accumulators.  Clearing clksel bit 7 after
 //  it was set is a hard reset of the chip (Previous scc_clock_write, Turbo).
 //
@@ -26,9 +29,10 @@
 //  loopback (WR14 $11, x16, TC $0A, RTxC) and polls up to ~5000 x 18 us per
 //  step, so a real-timed character (~1 ms) passes.
 //
-//  Serial: channel A (the NeXT's serial port A, the alternate console) is
-//  the MiSTer UART; channel B's receiver idles.  CTS/DCD are held asserted
-//  so the auto enables never gate the channels.  No SCC DMA (INT_SCC_DMA).
+//  Serial: one channel is the MiSTer UART -- port A (the alternate console,
+//  MIDI unit 0) or, with uart_b, port B (MIDI unit 1); the other channel's
+//  receiver idles.  CTS/DCD are held asserted so the auto enables never gate
+//  the channels.  No SCC DMA (INT_SCC_DMA).
 //
 //  Device port contract (tc_machine): stb 1-cycle, ack 1-cycle later.  A
 //  read presents RD for the stb cycle and latches the byte; the chip pops
@@ -53,8 +57,9 @@ module tc_scc
 
 	output            irq,           // INT_SCC
 
-	output            txd_a,         // serial port A
-	input             rxd_a
+	input             uart_b,        // 0 = port A on the UART, 1 = port B
+	output            txd,           // the MiSTer UART
+	input             rxd
 );
 
 reg [31:0] clksel;
@@ -72,23 +77,31 @@ wire [7:0] scc_dout;
 //---------------------------------------------------------------------------
 localparam [25:0] HZ_3684 = 26'd3686400;
 localparam [25:0] HZ_4000 = 26'd4000000;
+localparam [25:0] HZ_10M  = 26'd10000000;
 localparam [25:0] HZ_CLK  = CLK_HZ;
 
-reg [25:0] acc_3684 = 0, acc_4000 = 0;
-reg        en_3684, en_4000;
+reg [25:0] acc_3684 = 0, acc_4000 = 0, acc_10m = 0;
+reg        en_3684, en_4000, en_10m;
 always @(posedge clk) begin
 	en_3684 <= 0;
 	en_4000 <= 0;
+	en_10m  <= 0;
 	if (acc_3684 + HZ_3684 >= HZ_CLK) begin acc_3684 <= acc_3684 + HZ_3684 - HZ_CLK; en_3684 <= 1; end
 	else acc_3684 <= acc_3684 + HZ_3684;
 	if (acc_4000 + HZ_4000 >= HZ_CLK) begin acc_4000 <= acc_4000 + HZ_4000 - HZ_CLK; en_4000 <= 1; end
 	else acc_4000 <= acc_4000 + HZ_4000;
+	if (acc_10m + HZ_10M >= HZ_CLK) begin acc_10m <= acc_10m + HZ_10M - HZ_CLK; en_10m <= 1; end
+	else acc_10m <= acc_10m + HZ_10M;
 end
 
 // the register is the byte at +4: lane 3
 wire [7:0] clkb = clksel[31:24];
-wire rtxca_en = clkb[1] ? en_4000 : en_3684;
-wire rtxcb_en = clkb[3] ? en_4000 : en_3684;
+wire rtxca_en = (clkb[5:4] == 2'd3) ? en_10m  :
+                (clkb[5:4] != 2'd0) ? en_4000 :
+                clkb[1]             ? en_4000 : en_3684;
+wire rtxcb_en = (clkb[5:4] == 2'd3) ? en_10m  :
+                (clkb[5:4] != 2'd0) ? en_4000 :
+                clkb[3]             ? en_4000 : en_3684;
 
 //---------------------------------------------------------------------------
 // Reset: the machine reset, or clksel bit 7 going 1 -> 0
@@ -130,6 +143,9 @@ end
 wire int_n;
 assign irq = !int_n;
 
+wire txd_a, txd_b;
+assign txd = uart_b ? txd_b : txd_a;
+
 z8530_scc #(
 	.SOFT_RESET_EN(1),
 	.RR8_CTRL_POP(1),
@@ -153,10 +169,10 @@ z8530_scc #(
 
 	.int_n(int_n), .intack_n(1'b1),
 
-	.rxca(1'b0), .txca(1'b0), .rxda(rxd_a), .txda(txd_a),
+	.rxca(1'b0), .txca(1'b0), .rxda(uart_b ? 1'b1 : rxd), .txda(txd_a),
 	.ctsa_n(1'b0), .dcda_n(1'b0), .synca_n(1'b1), .rtsa_n(), .dtra_n(),
 
-	.rxcb(1'b0), .txcb(1'b0), .rxdb(1'b1), .txdb(),
+	.rxcb(1'b0), .txcb(1'b0), .rxdb(uart_b ? rxd : 1'b1), .txdb(txd_b),
 	.ctsb_n(1'b0), .dcdb_n(1'b0), .syncb_n(1'b1), .rtsb_n(), .dtrb_n()
 );
 

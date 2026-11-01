@@ -220,8 +220,9 @@ tc_machine machine
 	.enet_m_rdata(enet_m_rdata),
 	.enet_m_ack(enet_m_ack),
 
-	.scc_txd_a(),
-	.scc_rxd_a(1'b1),
+	.scc_uart_b(1'b0),
+	.scc_txd(),
+	.scc_rxd(1'b1),
 
 	.led(led),
 	.reset_req(reset_req),

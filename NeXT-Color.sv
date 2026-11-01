@@ -43,8 +43,8 @@ module emu
 
 assign ADC_BUS  = 'Z;
 assign USER_OUT = '1;
-// serial port A (tc_scc, Z8530 channel A) on the MiSTer UART: TXD/RXD only,
-// the SCC sees CTS/DCD asserted.
+// serial port A or B (OSD; tc_scc, Z8530 channel A/B) on the MiSTer UART:
+// TXD/RXD only, the SCC sees CTS/DCD asserted.
 assign {UART_RTS, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
@@ -105,6 +105,7 @@ localparam CONF_STR = {
 	"P1,Machine;",
 	"P2,Video;",
 	"P3,Input;",
+	"P4,Serial & MIDI;",
 	"P5,Advanced;",
 	"-;",
 	"h0-,Changes pending;",
@@ -121,6 +122,10 @@ localparam CONF_STR = {
 
 	// Input acts at once (not latched)
 	"P3O[9],Swap Alt/Win keys,No,Yes;",
+
+	// tc_scc, at once: which serial port is the MiSTer UART (Main's UART
+	// menu, e.g. MIDI: NeXTSTEP's MIDI unit 0 is port A, unit 1 is port B)
+	"P4O[12],Serial port on UART,A,B;",
 
 	"P5O[8:6],Boot device,SCSI disk,Prompt,Network,Floppy;",
 	"P5O[5],Self test,On,Off;",
@@ -443,8 +448,9 @@ tc_machine #(.CLK_HZ(CLK_SYS_HZ)) machine
 	.enet_m_rdata(enet_m_rdata),
 	.enet_m_ack(enet_m_ack),
 
-	.scc_txd_a(UART_TXD),
-	.scc_rxd_a(UART_RXD),
+	.scc_uart_b(status[12]),
+	.scc_txd(UART_TXD),
+	.scc_rxd(UART_RXD),
 
 	.led(led),
 	.reset_req(reset_req),
