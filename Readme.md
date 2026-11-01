@@ -24,13 +24,20 @@ A NeXTstation Turbo Color core for MiSTer: a 50 MHz 68040, the Turbo chipset,
 12-bit colour at 1120x832, NeXT ROM Rev 3.3 v74. It boots NeXTSTEP 3.3 to the
 colour desktop. Work in progress.
 
-**Release candidate 20261025** (`releases/NeXT-Color_20261025.rbf`, md5
-`379f9b27e6c83c7e5beb16bd58e99fae`, with `releases/MiSTer`, the Main it
-needs for the network): timing met on every clock at all four corners.  On
-hardware it boots NeXTSTEP 3.3 (3 of 3), BenchPress scores Dhrystone 243,
-Integer 287, Floating Point 142, the DSP plays mu-law and ATC sounds and
-Music Kit scores, and with this Main the network comes up on eth0 (the
-network was tried on the seed 4 build of the same source).
+**Release candidate 20261101** (`releases/NeXT-Color_20261101.rbf`, md5
+`4a94cd036754dc40ca418429d3befd8d`, with `releases/MiSTer`, the Main it
+needs for the network): 20261025 plus the Z8530 SCC (serial console and
+MIDI to an MT32-pi, see "Serial and MIDI"). Timing is met on every core
+clock; only the framework's HDMI PLL misses setup by 0.070 ns, with no
+effect seen on hardware. On hardware it boots NeXTSTEP 3.3, logs in over
+serial port A at 9600 baud and plays NeXTSTEP MIDI on an MT32-pi on port B.
+
+The previous release, **20261025** (`releases/NeXT-Color_20261025.rbf`,
+md5 `379f9b27e6c83c7e5beb16bd58e99fae`), met timing on every clock at all
+four corners. On hardware it boots NeXTSTEP 3.3 (3 of 3), BenchPress
+scores Dhrystone 243, Integer 287, Floating Point 142, the DSP plays mu-law
+and ATC sounds and Music Kit scores, and with this Main the network comes
+up on eth0.
 
 | Part | State |
 |---|---|
@@ -54,7 +61,7 @@ network was tried on the seed 4 build of the same source).
 
 ## Installing
 
-1. **Core**: `releases/NeXT-Color_20261025.rbf` in `_Computer/` (or
+1. **Core**: `releases/NeXT-Color_20261101.rbf` in `_Computer/` (or
    `_Unstable/`); keep the date in the name, as MiSTer's other cores do.
    Load it directly, not through an `.mgl` file (an MGL load once corrupted the
    remembered disk mount, `config/NeXT-Color.s0`).
