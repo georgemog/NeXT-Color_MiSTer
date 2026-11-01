@@ -9,8 +9,9 @@
 //     one survives WR5 TxEnable being cleared halfway through it.
 //  3. A character driven into RXD A arrives in RR8 and raises INT_SCC with
 //     WR1 RX-interrupt-on-all and WR9 MIE.
-//  4. MIDI as NeXTSTEP sets it up (clock select $30 = RTxC 10 MHz, TC 8,
+//  4. MIDI as NeXTSTEP sets it up (clock select $30 = PCLK 10 MHz, TC 8,
 //     x16): 31250 baud out and in, channel A, then channel B via uart_b.
+//  5. Under the same clock select, 9600 from RTxC (TC 10) for the console.
 `timescale 1ns/1ps
 module tb_tc_scc;
 
@@ -221,9 +222,10 @@ initial begin
 	else $display("ok   WR9 shared through channel B");
 
 	// --- 4. MIDI (NeXTSTEP mididriver deviceInit + kernel _zsintsetup/_zs_tc):
-	// clock select $30 = RTxC 10 MHz, BRG from RTxC (WR14 $00|1), TC 8, x16
+	// clock select $30 = PCLK 10 MHz, BRG from PCLK (WR14 $02|1), TC 8, x16
 	// -> 10e6 / (2 * 16 * (8 + 2)) = 31250 baud; on channel A, then channel B
-	// with uart_b (MIDI unit 1).
+	// with uart_b (MIDI unit 1).  Measured on hardware with PCLK left at
+	// 3.6864 MHz: 11520 baud, "UART break" on the MT32-pi.
 	wr(3'd4, 8'h30);
 	wr(3'd1, 8'h09); wr(3'd1, 8'hc0); delay_us(10);
 	for (i = 0; i < 2; i = i + 1) begin : midi_ch
@@ -238,8 +240,8 @@ initial begin
 		wr(c, 8'h0e); wr(c, 8'h00);
 		wr(c, 8'h0c); wr(c, 8'h08);
 		wr(c, 8'h0d); wr(c, 8'h00);
-		wr(c, 8'h0e); wr(c, 8'h00);
-		wr(c, 8'h0e); wr(c, 8'h01);
+		wr(c, 8'h0e); wr(c, 8'h02);
+		wr(c, 8'h0e); wr(c, 8'h03);
 		wr(c, 8'h03); wr(c, 8'hc1);
 		wr(c, 8'h05); wr(c, 8'h6a);
 		fork
@@ -258,6 +260,24 @@ initial begin
 		else $display("ok   MIDI ch%s RX $3c at 31250 baud", i ? "B" : "A");
 	end
 	uart_b = 0;
+
+	// --- 5. the login console under the same clock select: _zs_tc takes
+	// RTxC 3.6864 MHz for 9600 (TC 10, WR14 $00|1) -- RTxC must stay put.
+	wr(3'd1, 8'h09); wr(3'd1, 8'h80); delay_us(10);  // channel A reset
+	wr(3'd1, 8'h0b); wr(3'd1, 8'h50);
+	wr(3'd1, 8'h04); wr(3'd1, 8'h44);
+	wr(3'd1, 8'h03); wr(3'd1, 8'hc0);
+	wr(3'd1, 8'h05); wr(3'd1, 8'he2);
+	wr(3'd1, 8'h0e); wr(3'd1, 8'h00);
+	wr(3'd1, 8'h0c); wr(3'd1, 8'h0a);
+	wr(3'd1, 8'h0d); wr(3'd1, 8'h00);
+	wr(3'd1, 8'h0e); wr(3'd1, 8'h01);
+	wr(3'd1, 8'h03); wr(3'd1, 8'hc1);
+	wr(3'd1, 8'h05); wr(3'd1, 8'h6a);
+	fork
+		expect_tx(8'h6c, 9600.0);
+		wr(3'd3, 8'h6c);
+	join
 
 	if (errors == 0) $display("PASS tb_tc_scc");
 	else $display("FAIL tb_tc_scc: %0d error(s)", errors);

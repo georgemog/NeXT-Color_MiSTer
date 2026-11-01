@@ -15,13 +15,15 @@
 //  address wins.
 //
 //  Clocks (the byte at +4, lane 3; Previous scc.c scc_clock_write):
-//    PCLK   3.6864 MHz (WR14[1] = 1 takes the BRG from here)
-//    RTxC   bits 5:4 (Turbo "system clock"): 0 = 3.6864, 1/2 = 4, 3 = 10 MHz.
-//           NeXTSTEP 3.3's _zsintsetup ($0401a448) writes $30 on a Turbo and
-//           its _zs_tc ($04099b24) then counts RTxC as 10 MHz -- MIDI's 31250
-//           baud is TC 8 from it, which 3.6864 MHz cannot make.
-//           With bits 5:4 = 0, bit 1 (SCLKA_4_MHZ) / bit 3 (SCLKB_4_MHZ) give
-//           channel A / B 4 MHz: the ROM's scc_calc_baud_tc writes $0A.
+//    PCLK   bits 5:4 (Turbo "system clock"): 0 = 3.6864, 1/2 = 4, 3 = 10 MHz
+//           (WR14[1] = 1 takes the BRG from here)
+//    RTxC   bit 1 (SCLKA_4_MHZ) / bit 3 (SCLKB_4_MHZ): channel A / B 4 MHz,
+//           else 3.6864 MHz (the ROM's scc_calc_baud_tc writes $0A)
+//  NeXTSTEP 3.3's _zsintsetup ($0401a448) writes $30 on a Turbo; its _zs_tc
+//  ($04099b24) then weighs PCLK = 10 MHz (returned with bit 17, WR14 PCLK)
+//  against RTxC = 3.684 MHz and keeps the closer: MIDI's 31250 baud is PCLK
+//  TC 8, 9600 is RTxC TC 10.  (On the 68030 machines, type $139, it writes
+//  $0A and weighs PCLK 3.684 against RTxC 4 MHz.)
 //  all as clk strobes from phase accumulators.  Clearing clksel bit 7 after
 //  it was set is a hard reset of the chip (Previous scc_clock_write, Turbo).
 //
@@ -98,12 +100,10 @@ end
 
 // the register is the byte at +4: lane 3
 wire [7:0] clkb = clksel[31:24];
-wire rtxca_en = (clkb[5:4] == 2'd3) ? en_10m  :
-                (clkb[5:4] != 2'd0) ? en_4000 :
-                clkb[1]             ? en_4000 : en_3684;
-wire rtxcb_en = (clkb[5:4] == 2'd3) ? en_10m  :
-                (clkb[5:4] != 2'd0) ? en_4000 :
-                clkb[3]             ? en_4000 : en_3684;
+wire pclk_en  = (clkb[5:4] == 2'd3) ? en_10m  :
+                (clkb[5:4] != 2'd0) ? en_4000 : en_3684;
+wire rtxca_en = clkb[1] ? en_4000 : en_3684;
+wire rtxcb_en = clkb[3] ? en_4000 : en_3684;
 
 //---------------------------------------------------------------------------
 // Reset: the machine reset, or clksel bit 7 going 1 -> 0
@@ -159,7 +159,7 @@ z8530_scc #(
 	.TX_DATASHEET(1)
 ) scc (
 	.clk(clk), .pclk(clk), .sclk(clk),
-	.pclk_en(en_3684), .sclk_en(en_3684),
+	.pclk_en(pclk_en), .sclk_en(pclk_en),
 	.rtxca_en(rtxca_en), .rtxcb_en(rtxcb_en),
 	.reset_n(scc_rst_n),
 
