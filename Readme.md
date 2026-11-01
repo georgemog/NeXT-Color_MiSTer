@@ -1,5 +1,23 @@
 # NeXT-Color core for MiSTer
 
+**This is a fork** of the official core,
+[MiSTer-devel/NeXT-Color_MiSTer](https://github.com/MiSTer-devel/NeXT-Color_MiSTer).
+It branches from the official repository's first release (20261010) and adds:
+
+* the CPU at 50 MHz (the pipelined AP68040 on a 25 MHz machine bus; the
+  official core runs a 68040 at 33 MHz);
+* the DSP56001 in the FPGA (the Falcon_MiSTer DSP core), for Sound Kit and
+  Music Kit;
+* a Z8530 SCC with both serial ports (the Apple-Lisa_MiSTer chip): a
+  serial login console on the MiSTer UART, and NeXTSTEP MIDI out to an
+  MT32-pi;
+* the standard OSD layout (settings applied at reset), Power key and NMI
+  buttons, Swap Alt/Win keys, a Network interface setting, and memory no
+  larger than the SDRAM module.
+
+Releases in `releases/` are builds of this fork. For the official core, use
+MiSTer-devel's repository and its update script.
+
 ## General description
 
 A NeXTstation Turbo Color core for MiSTer: a 50 MHz 68040, the Turbo chipset,
@@ -25,6 +43,7 @@ network was tried on the seed 4 build of the same source).
 | Ethernet | On the MiSTer's LAN (optional) |
 | Sound out | 16-bit stereo, 44.1 and 22.05 kHz |
 | DSP56001 | In the FPGA, 12.5 MIPS, 8K words of external RAM (see "Sound and DSP"); Sound Kit and Music Kit work |
+| Serial ports | Z8530 SCC, ports A and B (see "Serial and MIDI"): a 9600 baud login console on the MiSTer UART, MIDI to an MT32-pi |
 | Sound in, DSP serial port, printer, ADB | Not present |
 
 * Design decisions: `docs/DECISIONS.md`. Hand-off state: the newest
@@ -101,6 +120,7 @@ The menu follows the MiSTer OSD standard
 | Machine > | P1: the **Power key** (NeXTSTEP's power-off panel, as F10) and **NMI (monitor)** (the ROM monitor, as F11) |
 | Video > | P2: **Aspect ratio** and **Scale**, how the scaler fits the picture (see Display) |
 | Input > | P3: **Swap Alt/Win keys** (see Keyboard and mouse) |
+| Serial & MIDI > | P4: **Serial port on UART** (A (default) or B: the SCC port wired to the MiSTer UART) and the MT32-pi settings (see Serial and MIDI) |
 | Advanced > | P5: **Boot device** (SCSI disk (default), Prompt = stay at `NeXT>`, Network or Floppy; written to the NVRAM boot command) and **Self test** (On: the ROM tests the machine at power-on; Off: a faster start) |
 | Changes pending | Shown while a changed setting is waiting for Apply and reset |
 | Apply and reset | Reset the machine with the current settings and close the OSD; the disk mounts stay |
@@ -250,6 +270,31 @@ be lost.
 * The DSP on the ARM (Previous's interpreter in Main, `next-color`, behind
   `rtl/tc_dsp.sv`) is still in the source: `NEXT_DSP_ARM` in
   `NeXT-Color.qsf` selects it.  `NEXT_NO_DSP` leaves the DSP out.
+
+## Serial and MIDI
+
+The Turbo's Z8530 SCC (`rtl/tc_scc.sv`, the chip `rtl/z8530_scc.sv` from
+Apple-Lisa_MiSTer) has both serial ports: port A is NeXTSTEP's `/dev/ttya`
+and MIDI unit 0, port B is `/dev/ttyb` and MIDI unit 1. The clock select
+register is there, so NeXTSTEP's own baud rates are exact (9600 to 38400,
+and 31250 for MIDI).
+
+* **Serial console.** **Serial port on UART** (Serial & MIDI page) picks the
+  port wired to the MiSTer UART, which Linux sees as `/dev/ttyS1`. To log
+  in over it, turn on getty for `ttya` in NeXTSTEP's `/etc/ttys`:
+  `ttya "/usr/etc/getty std.9600" vt100 on secure`, then `kill -HUP 1`.
+  On the MiSTer: `stty -F /dev/ttyS1 9600 cs7 parenb -parodd raw` and a
+  terminal program on `/dev/ttyS1`. While getty owns `ttya`, port A
+  cannot be used for MIDI.
+* **MIDI to an MT32-pi** on the user port: on the Serial & MIDI page
+  (its MT32-pi entries show once the MT32-pi answers) set **Use MT32-pi**
+  Yes and **MT32-pi on port** B (or A). Main's UART mode can stay None. The MT32-pi's audio comes back over I2S
+  and is mixed with the NeXT's sound. MIDI applications on the NeXT play to
+  the matching MIDI unit (port B = unit 1).
+* MidiLink (FluidSynth or MUNT on the MiSTer's ARM) gives no sound with
+  this core: it plays through Linux audio, which the core leaves out
+  (`MISTER_DISABLE_ALSA`).
+* No SCC DMA; the handshake lines (CTS, DCD) always read asserted.
 
 ## Troubleshooting
 
