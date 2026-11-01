@@ -29,10 +29,11 @@
 //  loopback (WR14 $11, x16, TC $0A, RTxC) and polls up to ~5000 x 18 us per
 //  step, so a real-timed character (~1 ms) passes.
 //
-//  Serial: one channel is the MiSTer UART -- port A (the alternate console,
-//  MIDI unit 0) or, with uart_b, port B (MIDI unit 1); the other channel's
-//  receiver idles.  CTS/DCD are held asserted so the auto enables never gate
-//  the channels.  No SCC DMA (INT_SCC_DMA).
+//  Serial: both channels' TxD/RxD come out (port A = NeXTSTEP's ttya, the
+//  alternate console, MIDI unit 0; port B = ttyb, MIDI unit 1); the top
+//  routes them to the MiSTer UART and the MT32-pi.  CTS/DCD are held
+//  asserted so the auto enables never gate the channels.  No SCC DMA
+//  (INT_SCC_DMA).
 //
 //  Device port contract (tc_machine): stb 1-cycle, ack 1-cycle later.  A
 //  read presents RD for the stb cycle and latches the byte; the chip pops
@@ -57,9 +58,10 @@ module tc_scc
 
 	output            irq,           // INT_SCC
 
-	input             uart_b,        // 0 = port A on the UART, 1 = port B
-	output            txd,           // the MiSTer UART
-	input             rxd
+	output            txd_a,         // serial port A
+	input             rxd_a,
+	output            txd_b,         // serial port B
+	input             rxd_b
 );
 
 reg [31:0] clksel;
@@ -143,8 +145,6 @@ end
 wire int_n;
 assign irq = !int_n;
 
-wire txd_a, txd_b;
-assign txd = uart_b ? txd_b : txd_a;
 
 z8530_scc #(
 	.SOFT_RESET_EN(1),
@@ -169,10 +169,10 @@ z8530_scc #(
 
 	.int_n(int_n), .intack_n(1'b1),
 
-	.rxca(1'b0), .txca(1'b0), .rxda(uart_b ? 1'b1 : rxd), .txda(txd_a),
+	.rxca(1'b0), .txca(1'b0), .rxda(rxd_a), .txda(txd_a),
 	.ctsa_n(1'b0), .dcda_n(1'b0), .synca_n(1'b1), .rtsa_n(), .dtra_n(),
 
-	.rxcb(1'b0), .txcb(1'b0), .rxdb(uart_b ? rxd : 1'b1), .txdb(txd_b),
+	.rxcb(1'b0), .txcb(1'b0), .rxdb(rxd_b), .txdb(txd_b),
 	.ctsb_n(1'b0), .dcdb_n(1'b0), .syncb_n(1'b1), .rtsb_n(), .dtrb_n()
 );
 

@@ -42,9 +42,7 @@ module emu
 ///////// Default values for ports not used yet /////////
 
 assign ADC_BUS  = 'Z;
-assign USER_OUT = '1;
-// serial port A or B (OSD; tc_scc, Z8530 channel A/B) on the MiSTer UART:
-// TXD/RXD only, the SCC sees CTS/DCD asserted.
+// serial ports: see "Serial ports, MT32-pi" below
 assign {UART_RTS, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
@@ -56,11 +54,10 @@ assign HDMI_FREEZE = 0;
 assign HDMI_BLACKOUT = 0;
 assign HDMI_BOB_DEINT = 0;
 
-// sound out: the machine's sound box (tc_kms), signed 16-bit stereo, clk_sys
+// sound out: the machine's sound box (tc_kms), signed 16-bit stereo, clk_sys,
+// mixed with the MT32-pi's I2S (below) when one is attached and in use
 wire [15:0] audio_l, audio_r;
 assign AUDIO_S = 1;
-assign AUDIO_L = audio_l;
-assign AUDIO_R = audio_r;
 assign AUDIO_MIX = 0;
 
 assign LED_POWER = 0;
@@ -70,7 +67,10 @@ assign BUTTONS = 0;
 
 `include "build_id.v"
 localparam CONF_STR = {
-	"NeXT-Color;;",
+	// UART...,MIDI: Main's UART menu (None/PPP/Console/MIDI/Modem; MIDI runs
+	// midilink -> FluidSynth/MUNT/USB MIDI on /dev/ttyS1).  Main shows it only
+	// for cores that declare their speeds here.
+	"NeXT-Color;UART9600:19200:38400:57600,MIDI;",
 	"-;",
 	// MiSTer OSD standard (danifunker/hp9000-715_MiSTer docs/osd-standard.md).
 	// Settings other than the media, Input and the P1 buttons take effect at
@@ -127,12 +127,43 @@ localparam CONF_STR = {
 	// menu, e.g. MIDI: NeXTSTEP's MIDI unit 0 is port A, unit 1 is port B)
 	"P4O[12],Serial port on UART,A,B;",
 
+	// MT32-pi on the USER port (sys/mt32pi.sv, as ao486), at once: shown only
+	// when one answers (menumask bit 1); MIDI out/in on the port picked here
+	"h1P4-;",
+	"h1P4-,MT32-pi:;",
+	"h1P4O[24],Use MT32-pi,Yes,No;",
+	"h1P4O[25],MT32-pi on port,B,A;",
+	"h1P4O[42:41],Show Info,No,Yes;",
+	"h1P4O[26],Synth,Munt,FluidSynth;",
+	"h1P4O[28:27],Munt ROM,MT-32 v1,MT-32 v2,CM-32L;",
+	"h1P4O[31:29],SoundFont,0,1,2,3,4,5,6,7;",
+	"h1P4R[40],Reset Hanging Notes;",
+
 	"P5O[8:6],Boot device,SCSI disk,Prompt,Network,Floppy;",
 	"P5O[5],Self test,On,Off;",
 
+	"I,",
+	"MT32-pi: SoundFont #0,",
+	"MT32-pi: SoundFont #1,",
+	"MT32-pi: SoundFont #2,",
+	"MT32-pi: SoundFont #3,",
+	"MT32-pi: SoundFont #4,",
+	"MT32-pi: SoundFont #5,",
+	"MT32-pi: SoundFont #6,",
+	"MT32-pi: SoundFont #7,",
+	"MT32-pi: MT-32 v1,",
+	"MT32-pi: MT-32 v2,",
+	"MT32-pi: CM-32L,",
+	"MT32-pi: Unknown mode;",
 	"v,1;",
 	"V,v",`BUILD_DATE
 };
+
+// serial ports and the MT32-pi (driven in "Serial ports, MT32-pi" below)
+wire scc_txd_a, scc_rxd_a, scc_txd_b, scc_rxd_b;
+wire mt32_newmode, mt32_available;
+reg        mt32_info_req;
+reg  [7:0] mt32_info_disp;
 
 wire   [1:0] buttons;
 wire [127:0] status;
@@ -179,7 +210,9 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(0), .VDNUM(5)) hps_io
 
 	.buttons(buttons),
 	.status(status),
-	.status_menumask({15'd0, cfg_pending}),
+	.status_menumask({13'd0, mt32_newmode, mt32_available, cfg_pending}),
+	.info_req(mt32_info_req),
+	.info(mt32_info_disp),
 
 	.ps2_key(ps2_key),
 	.ps2_mouse(ps2_mouse),
@@ -448,9 +481,10 @@ tc_machine #(.CLK_HZ(CLK_SYS_HZ)) machine
 	.enet_m_rdata(enet_m_rdata),
 	.enet_m_ack(enet_m_ack),
 
-	.scc_uart_b(status[12]),
-	.scc_txd(UART_TXD),
-	.scc_rxd(UART_RXD),
+	.scc_txd_a(scc_txd_a),
+	.scc_rxd_a(scc_rxd_a),
+	.scc_txd_b(scc_txd_b),
+	.scc_rxd_b(scc_rxd_b),
 
 	.led(led),
 	.reset_req(reset_req),
@@ -602,6 +636,94 @@ assign VGA_VS = ~vga_vs;
 // 35:26, square pixels (the mono core's lesson: a 4:3 declaration squeezes
 // 1120 columns into 1109).  "Normal" scale fills the output height with the
 // right aspect: 1454x1080 on 1080p, 969x720 on 720p.
+////////////////////////////  Serial ports, MT32-pi  ////////////////////////////
+//
+// tc_scc gives both Z8530 channels.  The MiSTer UART (Main's UART menu:
+// Console, PPP, MIDI via midilink, ...) takes port A or B (status[12]); an
+// MT32-pi on the USER port (sys/mt32pi.sv, wired as ao486) takes port B or A
+// (status[25]) for MIDI out and in -- NeXTSTEP's MIDI unit 1 / unit 0
+// (mididriver_reloc).  A port nobody listens to idles high.
+
+wire uart_b = status[12];
+wire mt32_a = status[25];
+
+wire        mt32_reset    = status[40] | reset;
+wire        mt32_disable  = status[24];
+wire        mt32_use      = mt32_available & ~mt32_disable;
+wire        mt32_mute     = mt32_available &  mt32_disable;
+wire        mt32_midi_rx;
+wire [15:0] mt32_i2s_l, mt32_i2s_r;
+wire  [7:0] mt32_mode, mt32_rom, mt32_sf;
+
+assign UART_TXD  = uart_b ? scc_txd_b : scc_txd_a;
+assign scc_rxd_a = !uart_b ? UART_RXD : (mt32_use && mt32_a)  ? mt32_midi_rx : 1'b1;
+assign scc_rxd_b =  uart_b ? UART_RXD : (mt32_use && !mt32_a) ? mt32_midi_rx : 1'b1;
+
+mt32pi mt32pi
+(
+	.CLK_AUDIO(CLK_AUDIO),
+	.CLK_VIDEO(clk_vid),
+	.CE_PIXEL(1'b1),
+	.VGA_VS(~vga_vs),
+	.VGA_DE(VGA_DE),
+
+	.USER_IN(USER_IN),
+	.USER_OUT(USER_OUT),
+
+	.reset(mt32_reset),
+	.midi_tx((mt32_a ? scc_txd_a : scc_txd_b) | mt32_mute),
+	.midi_rx(mt32_midi_rx),
+
+	.mt32_i2s_r(mt32_i2s_r),
+	.mt32_i2s_l(mt32_i2s_l),
+	.mt32_available(mt32_available),
+
+	.mt32_mode_req(status[26]),
+	.mt32_rom_req(status[28:27]),
+	.mt32_sf_req(status[31:29]),
+
+	.mt32_mode(mt32_mode),
+	.mt32_rom(mt32_rom),
+	.mt32_sf(mt32_sf),
+	.mt32_newmode(mt32_newmode),
+
+	.mt32_lcd_en(),
+	.mt32_lcd_pix(),
+	.mt32_lcd_update()
+);
+
+// OSD info on a mode change (status[42:41] = Yes), as ao486
+always @(posedge clk_sys) begin
+	reg old_mode;
+
+	old_mode <= mt32_newmode;
+	mt32_info_req <= (old_mode ^ mt32_newmode) && (status[42:41] == 2'd1);
+
+	mt32_info_disp <= (mt32_mode == 'hA2) ? (8'd1 + mt32_sf[2:0]) :
+	                  (mt32_mode == 'hA1 && mt32_rom == 0) ?  8'd9 :
+	                  (mt32_mode == 'hA1 && mt32_rom == 1) ?  8'd10 :
+	                  (mt32_mode == 'hA1 && mt32_rom == 2) ?  8'd11 : 8'd12;
+end
+
+// Audio: tc_kms's samples (clk_sys) are taken into CLK_AUDIO once they read
+// the same twice (they change at 44.1 kHz), and the MT32-pi's I2S (already
+// CLK_AUDIO) is added with saturation when it is in use.
+reg [15:0] kms_l1, kms_l2, kms_l, kms_r1, kms_r2, kms_r;
+reg [15:0] mix_l, mix_r;
+always @(posedge CLK_AUDIO) begin
+	reg [16:0] sum_l, sum_r;
+
+	kms_l1 <= audio_l; kms_l2 <= kms_l1; if (kms_l1 == kms_l2) kms_l <= kms_l2;
+	kms_r1 <= audio_r; kms_r2 <= kms_r1; if (kms_r1 == kms_r2) kms_r <= kms_r2;
+
+	sum_l = {kms_l[15], kms_l} + (mt32_use ? {mt32_i2s_l[15], mt32_i2s_l} : 17'd0);
+	sum_r = {kms_r[15], kms_r} + (mt32_use ? {mt32_i2s_r[15], mt32_i2s_r} : 17'd0);
+	mix_l <= (^sum_l[16:15]) ? {sum_l[16], {15{sum_l[15]}}} : sum_l[15:0];
+	mix_r <= (^sum_r[16:15]) ? {sum_r[16], {15{sum_r[15]}}} : sum_r[15:0];
+end
+assign AUDIO_L = mix_l;
+assign AUDIO_R = mix_r;
+
 // Both latched (cfg).
 wire [1:0] ar = cfg[122:121];
 // OSD order V-Integer, Normal, ... -> video_freak's 1, 0, 2, 3

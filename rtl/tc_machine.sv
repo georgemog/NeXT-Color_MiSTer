@@ -134,10 +134,12 @@ module tc_machine
 	input      [63:0] enet_m_rdata,
 	input             enet_m_ack,
 
-	// the MiSTer UART: serial port A, or port B with scc_uart_b (tc_scc)
-	input             scc_uart_b,
-	output            scc_txd,
-	input             scc_rxd,
+	// serial ports A and B (tc_scc); the top routes them to the MiSTer UART
+	// and the MT32-pi
+	output            scc_txd_a,
+	input             scc_rxd_a,
+	output            scc_txd_b,
+	input             scc_rxd_b,
 
 	output            led,
 	output            reset_req,          // KMS magic reset: the top resets the machine
@@ -720,7 +722,7 @@ tc_scc scc (
 	.stb(io_stb && io_dev == D_SCC && !io_tmc), .we(io_we),
 	.a2(io_addr[2]), .be(io_be), .wdata(io_wdata),
 	.rdata(scc_rdata), .ack(scc_ack),
-	.irq(int_scc), .uart_b(scc_uart_b), .txd(scc_txd), .rxd(scc_rxd));
+	.irq(int_scc), .txd_a(scc_txd_a), .rxd_a(scc_rxd_a), .txd_b(scc_txd_b), .rxd_b(scc_rxd_b));
 
 // Floppy: the Intel 82077 + the NeXT external control register at
 // $02014100..$02014108 (HS 10; Previous floppy.c, ioMemTabTurbo.c:197-208):

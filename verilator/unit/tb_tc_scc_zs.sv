@@ -20,13 +20,19 @@ reg  [31:0] wdata = 0;
 wire [31:0] rdata;
 wire        ack, irq, txd_a;
 reg         rxd_a = 1;
-reg         uart_b = 0;      // tc_scc: port B on the UART
+reg         uart_b = 0;      // NeXT-Color.sv status[9]: port B on the UART
 
 tc_scc #(.CLK_HZ(CLK_HZ)) dut (
 	.clk(clk), .reset(reset),
 	.stb(stb), .we(we), .a2(a2), .be(be), .wdata(wdata),
 	.rdata(rdata), .ack(ack),
-	.irq(irq), .uart_b(uart_b), .txd(txd_a), .rxd(rxd_a));
+	.irq(irq),
+	.txd_a(ch_txd_a), .rxd_a(uart_b ? 1'b1 : rxd_a),
+	.txd_b(ch_txd_b), .rxd_b(uart_b ? rxd_a : 1'b1));
+
+// the MiSTer UART as NeXT-Color.sv routes it (status[9] = uart_b)
+wire ch_txd_a, ch_txd_b;
+assign txd_a = uart_b ? ch_txd_b : ch_txd_a;
 
 integer errors = 0;
 
