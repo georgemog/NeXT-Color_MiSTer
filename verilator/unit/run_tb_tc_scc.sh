@@ -33,6 +33,21 @@ if [ "$rc" -ne 0 ] || ! grep -q '^PASS tb_tc_scc' "$LOG"; then
 fi
 echo "tb_tc_scc: OK"
 
+echo "== verilator (clk_sys 25 MHz)"
+LOG="$OUT/run25.log"
+verilator --binary --timing -Wno-fatal -Wno-WIDTH -Wno-INITIALDLY -GCLK_HZ=25000000 \
+	--top-module tb_tc_scc -Mdir "$OUT/obj25" -o Vtb "${RTL[@]}" "$TB" >"$OUT/build25.log" 2>&1 \
+	|| { cat "$OUT/build25.log"; exit 1; }
+set +e
+"$OUT/obj25/Vtb" | tee "$LOG"
+rc=${PIPESTATUS[0]}
+set -e
+if [ "$rc" -ne 0 ] || ! grep -q '^PASS tb_tc_scc' "$LOG"; then
+	echo "tb_tc_scc (25 MHz): FAILED (exit $rc)"
+	exit 1
+fi
+echo "tb_tc_scc (25 MHz): OK"
+
 echo "== verilator (zs driver emulation)"
 LOG="$OUT/run_zs.log"
 verilator --binary --timing -Wno-fatal -Wno-WIDTH -Wno-INITIALDLY \

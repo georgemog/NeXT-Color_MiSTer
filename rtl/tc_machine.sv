@@ -717,7 +717,7 @@ assign enet_m_wdata = mb_own ? ds_m_wdata : br_m_wdata;
 assign br_m_ack     = enet_m_ack && mb_busy && !mb_own;
 assign ds_m_ack     = enet_m_ack && mb_busy &&  mb_own;
 
-tc_scc scc (
+tc_scc #(.CLK_HZ(CLK_HZ)) scc (
 	.clk(clk), .reset(dev_rst),
 	.stb(io_stb && io_dev == D_SCC && !io_tmc), .we(io_we),
 	.a2(io_addr[2]), .be(io_be), .wdata(io_wdata),

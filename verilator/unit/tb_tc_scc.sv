@@ -13,12 +13,13 @@
 //     x16): 31250 baud out and in, channel A, then channel B via uart_b.
 //  5. Under the same clock select, 9600 from RTxC (TC 10) for the console.
 `timescale 1ns/1ps
-module tb_tc_scc;
-
-localparam CLK_HZ = 33000000;
+module tb_tc_scc
+#(
+	parameter CLK_HZ = 33000000   // the core's clk_sys: 33 MHz, 25 MHz on the fork
+);
 
 reg clk = 0;
-always #15.151 clk = !clk;       // 33 MHz
+always #(500000000.0 / CLK_HZ) clk = !clk;
 
 reg         reset = 1;
 reg         stb = 0, we = 0, a2 = 0;
@@ -72,7 +73,7 @@ task automatic rd(input [2:0] off, output [7:0] q);
 endtask
 
 task automatic delay_us(input integer us);
-	repeat (us * 33) @(posedge clk);
+	repeat (us * (CLK_HZ / 1000000)) @(posedge clk);
 endtask
 
 // RR0 poll as the ROM does: clr.b ctrl (pointer 0), read, mask
