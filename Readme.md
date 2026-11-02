@@ -326,14 +326,21 @@ and 31250 for MIDI).
 
 ## Credits
 
+* **Dani Funker** ([danifunker](https://github.com/danifunker),
+  [MiSTer-devel/NeXT-Color_MiSTer](https://github.com/MiSTer-devel/NeXT-Color_MiSTer)):
+  the NeXT-Color core this fork is built on, and the MiSTer OSD standard its
+  menu follows.
 * **Melkhior** ([MelkhiorVintageComputing/z8530_scc](https://github.com/MelkhiorVintageComputing/z8530_scc)):
   the Z8530 SCC model this core's serial ports are built on.
 * **alexthecat123** ([LisaFPGA](https://github.com/alexthecat123/LisaFPGA))
   and **Alanswx** ([MiSTer-devel/Apple-Lisa_MiSTer](https://github.com/MiSTer-devel/Apple-Lisa_MiSTer)):
   the Apple Lisa core, whose single-clock version of the SCC
   (`rtl/z8530_scc.sv`) this core imports.
-* **Apolkosnik** ([apolkosnik/Falcon_MiSTer](https://github.com/apolkosnik/Falcon_MiSTer)):
-  the DSP56001 core (`rtl/dsp56k`) that runs the NeXT's DSP in the FPGA.
+* **Apolkosnik** ([apolkosnik/AP68040](https://github.com/apolkosnik/AP68040),
+  [apolkosnik/Falcon_MiSTer](https://github.com/apolkosnik/Falcon_MiSTer)):
+  the AP68040, the pipelined 68040 (`rtl/ap68040`) that runs this core's CPU
+  at 50 MHz, and the DSP56001 core (`rtl/dsp56k`) that runs the NeXT's DSP
+  in the FPGA.
 
 ## Building
 
