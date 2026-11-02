@@ -324,6 +324,17 @@ and 31250 for MIDI).
   lot between builds: a build is released only when it meets timing, and a
   build that misses timing is only tried with NeXTSTEP shut down.
 
+## Credits
+
+* **Melkhior** ([MelkhiorVintageComputing/z8530_scc](https://github.com/MelkhiorVintageComputing/z8530_scc)):
+  the Z8530 SCC model this core's serial ports are built on.
+* **alexthecat123** ([LisaFPGA](https://github.com/alexthecat123/LisaFPGA))
+  and **Alanswx** ([MiSTer-devel/Apple-Lisa_MiSTer](https://github.com/MiSTer-devel/Apple-Lisa_MiSTer)):
+  the Apple Lisa core, whose single-clock version of the SCC
+  (`rtl/z8530_scc.sv`) this core imports.
+* **Apolkosnik** ([apolkosnik/Falcon_MiSTer](https://github.com/apolkosnik/Falcon_MiSTer)):
+  the DSP56001 core (`rtl/dsp56k`) that runs the NeXT's DSP in the FPGA.
+
 ## Building
 
 * `bash scripts/build_only.sh` (Git bash; `--check` = Analysis & Synthesis
