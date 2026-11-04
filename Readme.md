@@ -228,7 +228,7 @@ wired to; it takes effect at the next reset (Apply and reset):
 
 | Value | |
 |---|---|
-| eth0 (default) | The MiSTer's wired eth0, shared with Linux; the guest's own MAC, 00:00:0F:12:34:56, is filtered |
+| eth0 (default) | The MiSTer's wired eth0, shared with Linux; the guest gets the frames for its own MAC, the one in `boot0.rom` |
 | None | No cable |
 | eth1 | A second wired interface, if the MiSTer has one (else off) |
 | macvlan | A macvlan interface on eth0 |
@@ -245,6 +245,47 @@ ifconfig en0 192.168.1.38 netmask 255.255.255.0 up
 
 or permanently with HostManager, or `INETADDR`, `IPNETMASK` and `ROUTER` in
 `/etc/hostconfig`.
+
+### Two MiSTers on one network: give each NeXT its own MAC
+
+The NeXT's Ethernet address lives in the boot ROM, and every install of
+`releases/boot0.rom` has the same one, 00:00:0F:12:34:56. Two MiSTers running
+the core on the same LAN are then two machines with one MAC: switches send
+each one's traffic to whichever port last spoke, ARP caches and DHCP see one
+host, and both NeXTs' connections drop and stall. A cloned SD card or disk
+image carries the clash with it.
+
+`scripts/set_rom_mac.py` fixes this on the MiSTer itself: it sets the ROM's
+MAC to the NeXT OUI 00:00:0F plus the last three bytes of that MiSTer's eth0
+MAC, so each MiSTer gets a different, stable NeXT address. Python 3 standard
+library only. Copy it to `/media/fat/Scripts/` and run it over ssh:
+
+```
+python3 /media/fat/Scripts/set_rom_mac.py --check     # MAC and CRC of each NeXT boot0.rom
+python3 /media/fat/Scripts/set_rom_mac.py --dry-run   # what would change, nothing written
+python3 /media/fat/Scripts/set_rom_mac.py             # patch
+```
+
+| option | |
+|---|---|
+| `--check` | only print each ROM's MAC and whether its CRC is valid |
+| `--dry-run` | print the old and new MAC and CRC, write nothing |
+| (none) | patch: timestamped `boot0.rom.bak-YYYYmmdd-HHMMSS` next to the ROM, atomic write, read-back check; a ROM that already has the MAC is left alone |
+| `--rom PATH` | patch only `PATH` (repeatable); default: every `games/NeXT*/boot0.rom` in Main's search order (`/media/usb0`..`usb5`, `network`, `fat/cifs`, `fat`; the first one is the ROM the core loads) |
+| `--mac XX:XX:XX` | use these last three bytes instead of eth0's |
+| `--force` | patch a ROM whose existing CRC is bad (it refuses by default) |
+
+The ROM format: the MAC is bytes 8-13, and bytes 22-25 hold the CRC-32 (the
+zlib one) of bytes 0-21, big endian. The ROM checks it at reset; a ROM patched
+without fixing the CRC hangs with the floppy LED flashing, so do not hex-edit
+the MAC by hand.
+
+The core reads `boot0.rom` when it is loaded: reload the core (or reboot the
+MiSTer) for the new MAC to take effect; NeXTSTEP shows it at boot as
+`en0: Ethernet address 00:00:0f:...`. Then update anything keyed to the old
+MAC: the router's DHCP reservation or static lease for the NeXT, and
+the `hardware ethernet` lines of a `dhclient.conf` on the NeXT, if one was
+installed.
 
 ## Keyboard and mouse
 
@@ -312,6 +353,7 @@ and 31250 for MIDI).
 | `No SCSI disk`, or `SCSI error` | The stock Main is running. Check OSD -> About shows MiSTer v261009 or later (Installing, step 3) |
 | NeXTSTEP panics during boot (for example at the network) | With a core before 2026-10: more memory selected than the MiSTer's SDRAM module has; set Memory to 32 MB. Newer cores never give the machine more than the module |
 | No network (the link is up but nothing answers) | Network interface is None, or the Main is too old to read it (Installing, step 3): an older Main leaves the network off |
+| Network drops and stalls with two MiSTers running the core on one LAN | Both NeXTs have the same MAC, the one in `releases/boot0.rom`: run `scripts/set_rom_mac.py` on each MiSTer and reload the core (Network, Two MiSTers on one network) |
 | A setting changed but nothing happened | Settings outside the disks and Input wait for the next reset ("Changes pending"): use Apply and reset |
 | Stops at `NeXT>` | Boot device is "Prompt", or no disk image is mounted in "Pri. disk (ID 0)": mount one and type `bsd`, or set Boot device to "SCSI disk" and Apply and reset |
 | Blurry text | Display not set up: give the core a 1080p section in `MiSTer.ini` (Display) |
