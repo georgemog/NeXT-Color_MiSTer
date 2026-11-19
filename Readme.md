@@ -44,9 +44,8 @@ On hardware it boots NeXTSTEP 3.3. The DSP boots both NS 3.3 monitors,
 `playscore` plays Music Kit scores live, and DSP memory reads and writes
 pass `dsptest`.
 
-This build was compiled with one extra memory setting that is not in
-`main`: `NA_PG_HI` = `8'h04`, a write-allocate test, measured as a small
-net loss.
+A clean build of `main` reproduces this `.rbf` bit for bit
+(md5 `ebec2805b6f06861dbb951e6d6423a29`).
 
 The previous release, **20261101** (`releases/NeXT-Color_20261101.rbf`,
 md5 `4a94cd036754dc40ca418429d3befd8d`): 20261025 plus the Z8530 SCC
